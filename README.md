@@ -73,11 +73,11 @@ The build is staged as a numbered patch series on top of upstream `MrOz59/Apollo
 
 ### UX / safety
 
-- **0010 unhide-resolution-scale-factor-on-linux** — web UI's "Resolution Scale Factor" slider was hidden on Linux; it's actually wired up, just show it.
-- **0012 dxvk-hdr-off-when-client-sdr** — inject `DXVK_HDR=0` / `PROTON_ENABLE_HDR=0` when the moonlight client negotiated SDR so games don't render in HDR and look washed out.
-- **0015 add-gamescope-steam-session-app** — adds a default "Gamescope Steam Session" entry to `apps.json` that wraps Steam Big Picture in `gamescope` with FSR upscaling. The companion `apollo-gamescope-launch` helper script (installed to `/usr/bin/`) reads the client's actual `APOLLO_CLIENT_WIDTH/HEIGHT/FPS` env vars at runtime — apollo's `$(VAR)` substitution in apps.json doesn't compose with bash's `$(…)` syntax, so a standalone helper is the only reliable way to do this.
-- **0016 host-side-default-scale-factor** — `default_scale_factor = 120` in `sunshine.conf` applies to every app, instead of editing per-app entries.
-- **0021 monitor-recovery-safety-net** — **never leave the user's physical monitor disabled.** Writes the saved-primary name to `$XDG_STATE_HOME/apollo/saved-primary` the moment we disable an output. Two independent recovery paths consult it:
+- **10 unhide-resolution-scale-factor-on-linux** — web UI's "Resolution Scale Factor" slider was hidden on Linux; it's actually wired up, just show it.
+- **12 dxvk-hdr-off-when-client-sdr** — inject `DXVK_HDR=0` / `PROTON_ENABLE_HDR=0` when the moonlight client negotiated SDR so games don't render in HDR and look washed out.
+- **15 add-gamescope-steam-session-app** — adds a default "Gamescope Steam Session" entry to `apps.json` that wraps Steam Big Picture in `gamescope` with FSR upscaling. The companion `apollo-gamescope-launch` helper script (installed to `/usr/bin/`) reads the client's actual `APOLLO_CLIENT_WIDTH/HEIGHT/FPS` env vars at runtime — apollo's `$(VAR)` substitution in apps.json doesn't compose with bash's `$(…)` syntax, so a standalone helper is the only reliable way to do this.
+- **16 host-side-default-scale-factor** — `default_scale_factor = 120` in `sunshine.conf` applies to every app, instead of editing per-app entries.
+- **21 monitor-recovery-safety-net** — **never leave the user's physical monitor disabled.** Writes the saved-primary name to `$XDG_STATE_HOME/apollo/saved-primary` the moment we disable an output. Two independent recovery paths consult it:
   1. `kscreen::recover_on_startup()` runs the moment apollo starts.
   2. `ExecStopPost=-/usr/bin/apollo-monitor-recovery` on the systemd unit runs even after `SIGKILL`/OOM.
 
@@ -85,8 +85,8 @@ The build is staged as a numbered patch series on top of upstream `MrOz59/Apollo
 
 ### Archived (superseded)
 
-- **0005, 0006** — early event-loop / cleanup attempts, folded into 0007.
-- **0017** — PBO async CPU→GPU upload; added one frame of latency on AMD UMA hardware, reverted in favour of the synchronous `glTexSubImage2D` path.
+- **05, 06** — early event-loop / cleanup attempts, folded into 0007.
+- **17** — PBO async CPU→GPU upload; added one frame of latency on AMD UMA hardware, reverted in favour of the synchronous `glTexSubImage2D` path.
 
 ---
 
@@ -281,7 +281,7 @@ The PKGBUILD is descended from the AUR `apollo` package by xiota, pointed at MrO
 ---
 
 ## Disclaimer
-So i wanted to use the Apollo's capability to stream using virtual desktops, the Apollo-Linux did not worked correctly for me so I use Claude Code to make it work for my Rig added a Gamescope Session App and Resolution Scale Factor like Apollo in Windows, I hope it works for you
+So i wanted to use the Apollo's capability to stream using virtual desktops, the Apollo-Linux did not worked correctly for me so I use Claude Code to make it work for my Rig, I added a Gamescope Session App and Resolution Scale Factor like Apollo in Windows, I hope it works for you
 
 ---
 
