@@ -22,7 +22,7 @@ The upstream code did not work on KDE Plasma 6 / Wayland with the EVDI virtual d
 |---|---|
 | Confirmed working | **AMD Radeon (radeonsi / VAAPI)** on Linux + KDE Plasma 6 / Wayland |
 | Code paths exist for | Nvidia (nvenc), Intel (VAAPI/QSV), software encoders |
-| **NOT tested on Nvidia yet** | The author has an RTX 5060 Ti incoming and will validate after this AMD scenario is fully stable. PRs and issue reports from Nvidia users very welcome. |
+| **NOT tested on Nvidia yet** | incoming and will validate after this AMD scenario is fully stable. PRs and issue reports from Nvidia users very welcome. |
 | **Not a Sunshine / Apollo replacement on Windows** | This is a Linux-only delta. Windows builds of Apollo are upstream-only. |
 | Made with the help of an AI coding assistant (Claude / Claude Code) | See [§ AI-assisted disclosure](#ai-assisted-disclosure) below. |
 
@@ -53,23 +53,23 @@ The build is staged as a numbered patch series on top of upstream `MrOz59/Apollo
 
 ### EVDI + kwin plumbing (what makes a virtual display actually work)
 
-- **0001 fix-evdi-device-index** — upstream hardcoded `/dev/dri/card0` for EVDI; fixes lookup so it works regardless of which DRM minor your real GPU got.
-- **0002 promote-evdi-to-kscreen-primary** — after `evdi_connect` we poll `kscreen-doctor -j` for the new output and promote it to priority 1. Without this kwin keeps it disabled.
-- **0003 drop-spurious-drm-open** — upstream opened the EVDI card with `O_RDWR` for dead code; that competes with kwin for DRM master and kwin loses, so the connector is never enumerated. Removed.
-- **0004 kmsgrab-fallback-for-hotplugged-evdi** — kmsgrab's `card_descriptors` is built once at startup; a freshly hot-plugged EVDI isn't in it. Fall back to CRTC geometry instead of returning fatal `-1`.
-- **0007 evdi-cpu-buffer-capture-backend** — adds `display_evdi_t`, a capture path that reads pixels from a userspace CPU buffer instead of calling `gbm_create_device()` on the EVDI card (which SIGSEGVs mesa). Also adds the libevdi event-pump thread that drains `evdi_grab_pixels` and acks kwin's vblanks.
-- **0008 disable-physical-primary-during-stream** — during the stream, the user's real monitor is `kscreen-doctor … .disable`'d so games can't spawn on it and become invisible to the Deck.
-- **0009 edid-exact-60hz-1280x800** — hand-tuned CVT-RB timing so the synthetic EDID advertises a true 60.000 Hz (was drifting to 59.94 and breaking vsync).
-- **0011 edid-advertise-only-requested-resolution** — strip ghost modes from the generated EDID so games don't see resolutions the EVDI device can't actually deliver.
-- **0018 event-driven-evdi-capture** — `display_evdi_t::capture` now waits on a `condition_variable` notified by the libevdi event pump (instant wakeup on a fresh frame) but with a hard rate cap so the capture loop never outruns the encoder.
-- **0022 evdi-search-range-to-64** — `find_available_evdi_device()` was looping `0..15`; after several restart cycles new EVDI cards land at minor 16+ and apollo would silently fall back to passthrough. Bumped to `0..63`.
+- **01 fix-evdi-device-index** — upstream hardcoded `/dev/dri/card0` for EVDI; fixes lookup so it works regardless of which DRM minor your real GPU got.
+- **02 promote-evdi-to-kscreen-primary** — after `evdi_connect` we poll `kscreen-doctor -j` for the new output and promote it to priority 1. Without this kwin keeps it disabled.
+- **03 drop-spurious-drm-open** — upstream opened the EVDI card with `O_RDWR` for dead code; that competes with kwin for DRM master and kwin loses, so the connector is never enumerated. Removed.
+- **04 kmsgrab-fallback-for-hotplugged-evdi** — kmsgrab's `card_descriptors` is built once at startup; a freshly hot-plugged EVDI isn't in it. Fall back to CRTC geometry instead of returning fatal `-1`.
+- **07 evdi-cpu-buffer-capture-backend** — adds `display_evdi_t`, a capture path that reads pixels from a userspace CPU buffer instead of calling `gbm_create_device()` on the EVDI card (which SIGSEGVs mesa). Also adds the libevdi event-pump thread that drains `evdi_grab_pixels` and acks kwin's vblanks.
+- **08 disable-physical-primary-during-stream** — during the stream, the user's real monitor is `kscreen-doctor … .disable`'d so games can't spawn on it and become invisible to the Deck.
+- **09 edid-exact-60hz-1280x800** — hand-tuned CVT-RB timing so the synthetic EDID advertises a true 60.000 Hz (was drifting to 59.94 and breaking vsync).
+- **11 edid-advertise-only-requested-resolution** — strip ghost modes from the generated EDID so games don't see resolutions the EVDI device can't actually deliver.
+- **18 event-driven-evdi-capture** — `display_evdi_t::capture` now waits on a `condition_variable` notified by the libevdi event pump (instant wakeup on a fresh frame) but with a hard rate cap so the capture loop never outruns the encoder.
+- **22 evdi-search-range-to-64** — `find_available_evdi_device()` was looping `0..15`; after several restart cycles new EVDI cards land at minor 16+ and apollo would silently fall back to passthrough. Bumped to `0..63`.
 
-### Encoder + video pipeline (60 fps cleanly, not 50)
+### Encoder + video pipeline
 
-- **0013 vaapi-vbr-default-on-amd** — radeonsi's hevc/h264 VAAPI encoder needs VBR + single-frame VBV size to actually honour the host's max-bitrate ceiling; CQP is the default upstream and ignores it.
-- **0014 vaapi-quality-and-forced-idr** — set ffmpeg vaapi `quality=4` (balanced) + `forced_idr=1` so client IDR requests actually generate keyframes.
-- **0019 vaapi-quality-configurable** — expose `vaapi_quality = 0..8` in `sunshine.conf` so you can trade compression for encode speed without rebuilding.
-- **0020 fps-instrumentation-and-tighter-evdi-pump** — three new `[FPS-EVDI]` / `[FPS-CAP]` / `[FPS-ENC]` log lines every 5s telling you `pageflips_per_sec`, `pushed_per_sec`, `encoded_per_sec`, `skipped_per_sec`, `avg_encode_us`. Lets you pinpoint where the cap lives instead of guessing. Also drops the event-pump `usleep` from 2000us to 500us for a tighter kwin → libevdi → capture pipeline.
+- **13 vaapi-vbr-default-on-amd** — radeonsi's hevc/h264 VAAPI encoder needs VBR + single-frame VBV size to actually honour the host's max-bitrate ceiling; CQP is the default upstream and ignores it.
+- **14 vaapi-quality-and-forced-idr** — set ffmpeg vaapi `quality=4` (balanced) + `forced_idr=1` so client IDR requests actually generate keyframes.
+- **19 vaapi-quality-configurable** — expose `vaapi_quality = 0..8` in `sunshine.conf` so you can trade compression for encode speed without rebuilding.
+- **20 fps-instrumentation-and-tighter-evdi-pump** — three new `[FPS-EVDI]` / `[FPS-CAP]` / `[FPS-ENC]` log lines every 5s telling you `pageflips_per_sec`, `pushed_per_sec`, `encoded_per_sec`, `skipped_per_sec`, `avg_encode_us`. Lets you pinpoint where the cap lives instead of guessing. Also drops the event-pump `usleep` from 2000us to 500us for a tighter kwin → libevdi → capture pipeline.
 
 ### UX / safety
 
@@ -277,6 +277,13 @@ The name "Apollo-CachyOS" is just the rig of origin.
 - [KDE / kscreen-doctor](https://invent.kde.org/plasma/libkscreen) — the kwin output configuration tool.
 
 The PKGBUILD is descended from the AUR `apollo` package by xiota, pointed at MrOz59's upstream instead of LizardByte's.
+
+---
+
+## Disclaimer
+So i wanted to use the Apollo's capability to stream using virtual desktops, the Apollo-Linux did not worked correctly for me so I use Claude Code to make it work for my Rig added a Gamescope Session App and Resolution Scale Factor like Apollo in Windows, I hope it works for you
+
+---
 
 ---
 
