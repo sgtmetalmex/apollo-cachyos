@@ -1,209 +1,299 @@
-# Apollo
+# Apollo-CachyOS
 
-Apollo is a self-hosted desktop stream host for [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android). Offering low latency, native client resolution, cloud gaming server capabilities with support for AMD, Intel, and Nvidia GPUs for hardware encoding. Software encoding is also available. A web UI is provided to allow configuration and client pairing from your favorite web browser. Pair from the local server or any mobile device.
+A fork of [MrOz59/Apollo-Linux](https://github.com/MrOz59/Apollo-Linux) that finally streams a **real virtual display** to a Moonlight client on **CachyOS / Arch + KDE Plasma 6 (Wayland)**, with **first-class [Gamescope](https://github.com/ValveSoftware/gamescope) integration** for the SteamOS Gaming Mode experience — without booting into SteamOS.
 
-Major features:
+## Headline features
 
-- [x] Built-in Virtual Display with HDR support that matches the resolution/framerate config of your client automatically
-- [x] Permission management for clients
-- [x] Clipboard sync
-- [x] Commands for client connection/disconnection (checkout [Auto pause/resume games](https://github.com/ClassicOldSong/Apollo/wiki/Auto-pause-resume-games))
-- [x] Input only mode
+- 🖥️ **Real headless virtual display via EVDI** — the host's physical monitor stays free (or asleep) while your client streams its own dedicated desktop at the client's exact resolution, refresh rate, and HDR state. Fixes the upstream kwin / Wayland integration that was silently mirroring the physical monitor instead.
+- 🎮 **Gamescope Steam Session integration** — a built-in app entry launches **Steam Big Picture inside [Gamescope](https://github.com/ValveSoftware/gamescope)**, the same micro-compositor SteamOS uses for Gaming Mode. You get FSR upscaling, tear-free presentation, and gamescope's keybinds (Super+F to toggle fullscreen, Super+I/O for FSR sharpness, etc.) — all wrapped in a Moonlight app entry that picks up the client's exact `WIDTH × HEIGHT @ FPS` at launch via a small `/usr/bin/apollo-gamescope-launch` helper script.
+- 🔍 **Resolution Scale Factor — alive on Linux** — Apollo's per-app "Resolution Scale Factor" slider (well-known on Windows) was hidden from the Linux web UI even though the host-side rendering code already supported it. This fork unhides it, AND adds a `default_scale_factor` global setting in `sunshine.conf` so you don't have to edit every app entry. Result: stream a `1280×800` client like a Steam Deck at `1536×960` (120%) for sharper text and UI without changing the client's request.
+- 🛡️ **Crash-safe monitor recovery** — apollo can be SIGKILL'd, OOM-killed, or the box can lose power; the physical monitor still comes back automatically via a state file + two independent recovery paths (`systemd ExecStopPost` + `recover_on_startup()`).
+- 🎬 **VAAPI VBR + low-latency tuning** for AMD radeonsi, with a configurable `vaapi_quality` knob to trade compression for encode speed.
+- 📊 **Per-stage fps instrumentation** (`[FPS-EVDI]` / `[FPS-CAP]` / `[FPS-ENC]` log lines every 5 seconds) so you can pinpoint where any framerate cap actually lives.
+- 🔧 **Standalone EVDI pageflip-rate probe** for diagnosing kwin behaviour without apollo or Moonlight in the loop.
 
-## Usage
+The upstream code did not work on KDE Plasma 6 / Wayland with the EVDI virtual display: it created the EVDI card but kwin left the output disabled, so Apollo silently captured the physical display. This fork is 19 patches that fix that end-to-end, plus the Gamescope integration and quality-of-life improvements on top.
 
-Refer to LizardByte's documentation hosted on [Read the Docs](https://docs.lizardbyte.dev/projects/sunshine) for now.
+---
 
-Currently Virtual Display support is Windows only, Linux support is planned and will be implemented in the future.
+## ⚠️ Status
 
-## About Permission System
+| | |
+|---|---|
+| Confirmed working | **AMD Radeon (radeonsi / VAAPI)** on Linux + KDE Plasma 6 / Wayland |
+| Code paths exist for | Nvidia (nvenc), Intel (VAAPI/QSV), software encoders |
+| **NOT tested on Nvidia yet** | The author has an RTX 5060 Ti incoming and will validate after this AMD scenario is fully stable. PRs and issue reports from Nvidia users very welcome. |
+| **Not a Sunshine / Apollo replacement on Windows** | This is a Linux-only delta. Windows builds of Apollo are upstream-only. |
+| Made with the help of an AI coding assistant (Claude / Claude Code) | See [§ AI-assisted disclosure](#ai-assisted-disclosure) below. |
 
-Check out the [Wiki](https://github.com/ClassicOldSong/Apollo/wiki/Permission-System)
+---
 
-> [!NOTE]
-> The **FIRST** client paired with Apollo will be granted with FULL permissions, then other newly paired clients will only be granted with `View Streams` and `List Apps` permission. If you encounter `Permission Denied` error when trying to launch any app, go check the permission for that device and grant `Launch Apps` permission. The same applies to the situation when you find that you can't move mouse or type with keyboard on newly paired clients, grant the corresponding client `Mouse Input` and `Keyboard Input` permissions.
+## Tested hardware (the rig this was built and validated on)
 
-## About Virtual Display
+| | |
+|---|---|
+| Distro | CachyOS (rolling) |
+| Kernel | `linux-cachyos 7.0.5-2` |
+| CPU | (any modern x86_64) |
+| GPU | **AMD Radeon RX 9070 XT** (RDNA4, gfx1201) |
+| Mesa | `2:26.1.0` (radeonsi + libva-mesa-driver) |
+| Compositor | KDE Plasma 6 / `kwin_wayland` |
+| EVDI | `evdi-dkms 1.14.16` |
+| Apollo base | `0.4.8.r4.evdi` (MrOz59 fork) |
+| Client | Moonlight on **Steam Deck LCD** (1280×800, 60Hz, HEVC) |
+| Network | Local LAN |
 
-> [!WARNING]
-> ***It is highly recommend to remove any other virtual display solutions from your system and Apollo/Sunshine config, to reduce confusions and compatibility issues.***
+The host runs apollo as a `systemd --user` service. The Steam Deck connects via Moonlight over LAN.
 
-> [!NOTE]
-> **TL;DR** Just treat your Artemis/Moonlight client like a dedicated PnP monitor with Apollo.
+---
 
-Apollo uses SudoVDA for virtual display. It features auto resolution and framerate matching for your Artemis/Moonlight clients. The virtual display is created upon the stream starts and removed once the app quits. **If you do not see a new virtual display added or removed when the stream starts or stops, there may be a driver misconfiguration, or another persistent virtual display might still be active.**
+## What this fork actually does (the 22 patches)
 
-The virtual display works just like any physically attached monitors with SudoVDA, there's completely no need for a super complicated solution to "fix" resolution configurations for your devices. Unlike all other solutions that reuses one identity or generate a random one each time for any virtual display sessions, **Apollo assigns a fixed identity for each Artemis/Moonlight client, so your display configuration will be automatically remembered and managed by Windows natively.**
+The build is staged as a numbered patch series on top of upstream `MrOz59/Apollo-Linux`. Three patches were superseded by later ones and are archived under [`patches/archive/`](patches/archive/); the rest are applied in order by the PKGBUILD. Group summary:
 
-## Configuration for dual GPU laptops
+### EVDI + kwin plumbing (what makes a virtual display actually work)
 
-Apollo supports dual GPUs seamlessly.
+- **0001 fix-evdi-device-index** — upstream hardcoded `/dev/dri/card0` for EVDI; fixes lookup so it works regardless of which DRM minor your real GPU got.
+- **0002 promote-evdi-to-kscreen-primary** — after `evdi_connect` we poll `kscreen-doctor -j` for the new output and promote it to priority 1. Without this kwin keeps it disabled.
+- **0003 drop-spurious-drm-open** — upstream opened the EVDI card with `O_RDWR` for dead code; that competes with kwin for DRM master and kwin loses, so the connector is never enumerated. Removed.
+- **0004 kmsgrab-fallback-for-hotplugged-evdi** — kmsgrab's `card_descriptors` is built once at startup; a freshly hot-plugged EVDI isn't in it. Fall back to CRTC geometry instead of returning fatal `-1`.
+- **0007 evdi-cpu-buffer-capture-backend** — adds `display_evdi_t`, a capture path that reads pixels from a userspace CPU buffer instead of calling `gbm_create_device()` on the EVDI card (which SIGSEGVs mesa). Also adds the libevdi event-pump thread that drains `evdi_grab_pixels` and acks kwin's vblanks.
+- **0008 disable-physical-primary-during-stream** — during the stream, the user's real monitor is `kscreen-doctor … .disable`'d so games can't spawn on it and become invisible to the Deck.
+- **0009 edid-exact-60hz-1280x800** — hand-tuned CVT-RB timing so the synthetic EDID advertises a true 60.000 Hz (was drifting to 59.94 and breaking vsync).
+- **0011 edid-advertise-only-requested-resolution** — strip ghost modes from the generated EDID so games don't see resolutions the EVDI device can't actually deliver.
+- **0018 event-driven-evdi-capture** — `display_evdi_t::capture` now waits on a `condition_variable` notified by the libevdi event pump (instant wakeup on a fresh frame) but with a hard rate cap so the capture loop never outruns the encoder.
+- **0022 evdi-search-range-to-64** — `find_available_evdi_device()` was looping `0..15`; after several restart cycles new EVDI cards land at minor 16+ and apollo would silently fall back to passthrough. Bumped to `0..63`.
 
-If you want to use your dGPU, just set the `Adapter Name` to your dGPU and enable `Headless mode` in `Audio/Video` tab, save and restart your computer. No dummy plug is needed any more, the image will be rendered and encoded directly from your dGPU.
+### Encoder + video pipeline (60 fps cleanly, not 50)
 
-## About HDR
+- **0013 vaapi-vbr-default-on-amd** — radeonsi's hevc/h264 VAAPI encoder needs VBR + single-frame VBV size to actually honour the host's max-bitrate ceiling; CQP is the default upstream and ignores it.
+- **0014 vaapi-quality-and-forced-idr** — set ffmpeg vaapi `quality=4` (balanced) + `forced_idr=1` so client IDR requests actually generate keyframes.
+- **0019 vaapi-quality-configurable** — expose `vaapi_quality = 0..8` in `sunshine.conf` so you can trade compression for encode speed without rebuilding.
+- **0020 fps-instrumentation-and-tighter-evdi-pump** — three new `[FPS-EVDI]` / `[FPS-CAP]` / `[FPS-ENC]` log lines every 5s telling you `pageflips_per_sec`, `pushed_per_sec`, `encoded_per_sec`, `skipped_per_sec`, `avg_encode_us`. Lets you pinpoint where the cap lives instead of guessing. Also drops the event-pump `usleep` from 2000us to 500us for a tighter kwin → libevdi → capture pipeline.
 
-HDR starts supporting from Windows 11 23H2 and generally supported on 24H2. Some systems might not have HDR toggle on 23H2 and you just need to upgrade to 24H2. Any system lower than 23H2/Windows 10 will not have HDR option available.
+### UX / safety
 
-> [!NOTE]
-> The below section is written for professional media workers. It doesn't stop you from enabling HDR if you know what you're doing and have deep understanding about how HDR works.
->
-> Apollo and SudoVDA can handle HDR just fine like any other streaming solutions.
->
-> If you have had good experience with HDR previously, you can safely ignore this section.
->
-> If you're curious, read on, but don't blame Apollo for poor HDR support.
+- **0010 unhide-resolution-scale-factor-on-linux** — web UI's "Resolution Scale Factor" slider was hidden on Linux; it's actually wired up, just show it.
+- **0012 dxvk-hdr-off-when-client-sdr** — inject `DXVK_HDR=0` / `PROTON_ENABLE_HDR=0` when the moonlight client negotiated SDR so games don't render in HDR and look washed out.
+- **0015 add-gamescope-steam-session-app** — adds a default "Gamescope Steam Session" entry to `apps.json` that wraps Steam Big Picture in `gamescope` with FSR upscaling. The companion `apollo-gamescope-launch` helper script (installed to `/usr/bin/`) reads the client's actual `APOLLO_CLIENT_WIDTH/HEIGHT/FPS` env vars at runtime — apollo's `$(VAR)` substitution in apps.json doesn't compose with bash's `$(…)` syntax, so a standalone helper is the only reliable way to do this.
+- **0016 host-side-default-scale-factor** — `default_scale_factor = 120` in `sunshine.conf` applies to every app, instead of editing per-app entries.
+- **0021 monitor-recovery-safety-net** — **never leave the user's physical monitor disabled.** Writes the saved-primary name to `$XDG_STATE_HOME/apollo/saved-primary` the moment we disable an output. Two independent recovery paths consult it:
+  1. `kscreen::recover_on_startup()` runs the moment apollo starts.
+  2. `ExecStopPost=-/usr/bin/apollo-monitor-recovery` on the systemd unit runs even after `SIGKILL`/OOM.
 
-Whether HDR streaming looks good, it depends completely on your client.
+  Apollo can crash, get OOM-killed, or the box can lose power — your monitor still comes back.
 
-In short, ICC color correction should be totally useless while streaming HDR. It's your client's job to get HDR content displayed right, not the host. But in fact, it does affect the captured video stream and reflect changes on devices that can handle HDR correctly. On other devices that can't, the info is not respected at all.
+### Archived (superseded)
 
-It's very complicated to explain why HDR is a total mess, and why enabling HDR makes the image appear dark/yellow. If it's your first time got HDR streaming working, and thinks HDR looks awful, you're right, but that's not Apollo's fault, it's your device that tone mapped SDR content to the maximum of the capability of its screen, there's no headroom for anything beyond that actual peak brightness for HDR. For details, please take a look [here](https://github.com/ClassicOldSong/Apollo/issues/164).
+- **0005, 0006** — early event-loop / cleanup attempts, folded into 0007.
+- **0017** — PBO async CPU→GPU upload; added one frame of latency on AMD UMA hardware, reverted in favour of the synchronous `glTexSubImage2D` path.
 
-For client devices, usually Apple products that have HDR capability can be trusted to have good results, other than that, your luck depends.
+---
 
-<details>
-<summary>DEPRECATION ALERT</summary>
-
-Enabling HDR is **generally not recommended** with **ANY streaming solutions** at this moment, probably in the long term. The issue with **HDR itself** is huge, with loads of semi-incompatible standards, and massive variance between device configurations and capabilities. Game support for HDR is still choppy.
-
-SDR actually provides much more stable color accuracy, and are widely supported throughout most devices you can imagine. For games, art style can easily overcome the shortcoming with no HDR, and SDR has pretty standard workflows to ensure their visual performance. So HDR isn't *that* important in most of the cases.
-
-</details>
-
-## How to run multiple instances of Apollo for multiple virtual displays
-
-Follow the instructions in the [Wiki](https://github.com/ClassicOldSong/Apollo/wiki/How-to-start-multiple-instances-of-Apollo).
-
-## FAQ
-Moved to [WiKi](https://github.com/ClassicOldSong/Apollo/wiki/FAQ)
-
-## Stuttering Clinic
-Here're some common causes and solutions for stutters: [WiKi](https://github.com/ClassicOldSong/Apollo/wiki/Stuttering-Clinic).
-
-## Device specific setups
-- Pixel devices might not be able to use native resolution:
-  - Change the device resolution to High: https://github.com/ClassicOldSong/Apollo/issues/700
-
-## System Requirements
-
-> **Warning**: This table is a work in progress. Do not purchase hardware based on this.
-
-**Minimum Requirements**
-
-| **Component** | **Description** |
-|---------------|-----------------|
-| GPU           | AMD: VCE 1.0 or higher, see: [obs-amd hardware support](https://github.com/obsproject/obs-amd-encoder/wiki/Hardware-Support) |
-|               | Intel: VAAPI-compatible, see: [VAAPI hardware support](https://www.intel.com/content/www/us/en/developer/articles/technical/linuxmedia-vaapi.html) |
-|               | Nvidia: NVENC enabled cards, see: [nvenc support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new) |
-| CPU           | AMD: Ryzen 3 or higher |
-|               | Intel: Core i3 or higher |
-| RAM           | 4GB or more |
-| OS            | Windows: 10+ (Windows Server requires [manual installation](https://github.com/nefarius/ViGEmBus/issues/153) for gamepad support) |
-|               | macOS: 12+ |
-|               | Linux/Debian: 11 (bullseye) |
-|               | Linux/Fedora: 39+ |
-|               | Linux/Ubuntu: 22.04+ (jammy) |
-| Network       | Host: 5GHz, 802.11ac |
-|               | Client: 5GHz, 802.11ac |
-
-**4k Suggestions**
-
-| **Component** | **Description** |
-|---------------|-----------------|
-| GPU           | AMD: Video Coding Engine 3.1 or higher |
-|               | Intel: HD Graphics 510 or higher |
-|               | Nvidia: GeForce GTX 1080 or higher |
-| CPU           | AMD: Ryzen 5 or higher |
-|               | Intel: Core i5 or higher |
-| Network       | Host: CAT5e ethernet or better |
-|               | Client: CAT5e ethernet or better |
-
-**HDR Suggestions**
-
-| **Component** | **Description** |
-|---------------|-----------------|
-| GPU           | AMD: Video Coding Engine 3.4 or higher |
-|               | Intel: UHD Graphics 730 or higher |
-|               | Nvidia: Pascal-based GPU (GTX 10-series) or higher |
-| CPU           | AMD: todo |
-|               | Intel: todo |
-| Network       | Host: CAT5e ethernet or better |
-|               | Client: CAT5e ethernet or better |
-
-## Integrations
-
-SudoVDA: Virtual Display Adapter Driver used in Apollo
-
-[Artemis](https://github.com/ClassicOldSong/moonlight-android): Integrated Virtual Display options control from client side
-
-**NOTE**: Artemis currently supports Android only. Other platforms will come later.
-
-## Support
-
-Currently support is only provided via GitHub Issues/Discussions.
-
-No real time chat support will ever be provided for Apollo and Artemis. Including but not limited to:
-
-- Discord
-- Telegram
-- Whatsapp
-- QQ
-- WeChat 
-
-> When there's a chat, there're dramas. -- Confucius
-
-## Downloads
-
-### Direct Download
-
-**Recommended**
-
-[Releases](https://github.com/ClassicOldSong/Apollo/releases)
-
-### WinGet
-
-**Note:** Community maintained
-
-In an elevated PowerShell window, run
-
-```pwsh
-winget install ClassicOldSong.Apollo
+## Repo layout
 
 ```
-
-You'll need WinGet installed first.
-
-### Chocolatey
-
-**Note:** Community maintained
-
-You can also install the apollo streaming server with chocolatey.
-
-Install Chocolatey if you don't have it, then run the following command in an elevated PowerShell/CMD window:
-
-```pwsh
-choco upgrade apollo -y 
+Apollo-CachyOS/
+├── README.md                       # this file
+├── LICENSE                         # GPL-3.0-only (inherited from upstream)
+├── PKGBUILD                        # Arch / CachyOS build recipe
+├── apollo.install                  # pacman pre/post install hooks (CAP_SYS_ADMIN reminder)
+├── evdi-perms.service              # system unit: lets `video` group write /sys/devices/evdi/{add,remove_all}
+├── apollo-monitor-recovery.sh      # installed as /usr/bin/apollo-monitor-recovery (ExecStopPost)
+├── apollo-gamescope-launch.sh      # installed as /usr/bin/apollo-gamescope-launch (the Gamescope app's cmd)
+├── patches/                        # numbered patch series applied by PKGBUILD's prepare()
+│   ├── 0001-fix-evdi-device-index.patch
+│   ├── 0002-promote-evdi-to-kscreen-primary.patch
+│   ├── …
+│   ├── 0022-evdi-search-range-to-64.patch
+│   └── archive/                    # archived/superseded patches (not applied)
+└── tests/
+    ├── evdi_pageflip_probe.py      # standalone libevdi-only kwin pageflip-rate probe
+    └── test_evdi_kscreen.py        # exercises evdi_add_device + kscreen-doctor promotion
 ```
 
-Same command can be used to upgrade, add to a scheduled task to automate updates.
+---
 
-See more details on the chocolatey package [here](https://community.chocolatey.org/packages/apollo)
+## Build & install
 
-## Disclaimer
+```bash
+git clone https://github.com/<your-fork-here>/Apollo-CachyOS.git
+cd Apollo-CachyOS
+makepkg -f                                           # builds apollo-0.4.8.r4.evdi-99-x86_64.pkg.tar.zst
+sudo pacman -U apollo-*.pkg.tar.zst
+sudo systemctl enable --now evdi-perms.service        # so the video group can write /sys/devices/evdi/add
+systemctl --user enable --now apollo                  # starts the streaming server
+```
 
-I got kicked from Moonlight and Sunshine's Discord server and banned from Sunshine's GitHub repo literally for helping people out.
+The PKGBUILD is the only one you need; it git-clones MrOz59/Apollo-Linux into `src/`, applies all 19 active patches, builds, and packages.
 
-This is what I got for finding a bug, opened an issue, getting no response, troubleshoot myself, fixed the issue myself, shared it by PR to the main repo hoping my efforts can help someone else during the maintenance gap.
+### Runtime requirements
 
-Yes, I'm going away. [Apollo](https://github.com/ClassicOldSong/Apollo) and [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android) will no longer be compatible with OG Sunshine and OG Moonlight eventually, but they'll work even better with much more carefully designed features.
+| | |
+|---|---|
+| Kernel | `evdi` module loaded (`modprobe evdi`). With `evdi-dkms` installed and `evdi-perms.service` enabled this is automatic. |
+| Compositor | KDE Plasma 6 / `kwin_wayland`. The kscreen integration depends on `kscreen-doctor` being installed (optdep). |
+| User session | systemd `--user` (so the systemd unit can pick up `WAYLAND_DISPLAY` and friends). |
+| Group | Your user must be in the `video` group (`gpasswd -a $USER video`). |
+| For the Gamescope app entry | `gamescope` 3.16+. |
 
-The Moonlight repo had stayed silent for 5 months, with nobody actually responding to issues, and people are getting totally no help besides the limited FAQ in their Discord server. I tried to answer issues and questions, solve problems within my ability but I got kicked out just for helping others.
+### `optdepends` already declared in the PKGBUILD
 
-**PRs for feature improvements are welcomed here unlike the main repo, your ideas are more likely to be appreciated and your efforts are actually being respected. We welcome people who can and willing to share their efforts, helping yourselves and other people in need.**
+- `intel-media-driver` — Intel VAAPI encode
+- `libva-mesa-driver` — **AMD VAAPI encode (this is what's tested)**
+- `kscreen` — required on KDE Plasma to auto-promote the EVDI output to primary
+- `gamescope` — needed if you want the "Gamescope Steam Session" app entry
 
-**Update**: They have contacted me and apologized for this incident, but the fact it **happened** still motivated me to start my own fork.
+---
+
+## Using the Gamescope Steam Session app
+
+Once installed, Moonlight on your client will show a new app entry alongside Desktop and Steam Big Picture:
+
+| App entry | What it does |
+|---|---|
+| **Desktop** | streams your KDE Plasma desktop on the virtual display |
+| **Steam Big Picture** | launches Steam in big-picture mode on the virtual display (uses KDE for compositing) |
+| **Gamescope Steam Session** | launches Steam in big-picture mode **inside a Gamescope micro-compositor** running on the virtual display |
+
+What the Gamescope path gives you that the plain Steam Big Picture path doesn't:
+
+- **AMD FidelityFX Super Resolution (FSR) upscaling.** Configured to filter `fsr` with sharpness 4 (gamescope's 0-20 scale, 0 = sharpest). For games rendering below the client's native resolution, this is the same upscaler SteamOS uses in Gaming Mode.
+- **Tear-free presentation** independent of KDE's compositor pageflip semantics.
+- **No KDE Plasma window decorations / panels** — gamescope owns the whole virtual output for as long as the session runs.
+- **Gamescope keybindings** (Super+F fullscreen toggle, Super+N nearest-neighbour, Super+U FSR toggle, Super+I/O sharpness up/down).
+
+### How it's wired up
+
+```
+Moonlight on client → apollo's "Gamescope Steam Session" app entry
+   → /usr/bin/apollo-gamescope-launch  (helper script, reads env)
+   → gamescope -W $APOLLO_CLIENT_WIDTH -H $APOLLO_CLIENT_HEIGHT -r $FPS \
+                -f -e -F fsr --fsr-sharpness 4 -- steam -bigpicture
+```
+
+The helper script is the small piece that makes the integration robust: apollo's `$(VAR)` substitution in apps.json greedily intercepts every `$(…)` pattern at parse time, so inline bash with `$(date)` etc. silently breaks. Putting the launch logic in a standalone script bypasses that entirely.
+
+### Tuning
+
+Edit `/usr/bin/apollo-gamescope-launch` (or copy it into your `~/.local/bin/` to override system-wide). Most useful tweaks:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--fsr-sharpness N` | `4` | 0 = maximum sharpening, 20 = minimum. Drop to `8`-`10` if text looks over-sharpened. |
+| `-F nearest` | `fsr` | Nearest-neighbour upscaling instead of FSR (sharper but pixelated). |
+| `-S integer` | not set | Integer-scale upscaling — useful for pixel-art games. |
+| `--immediate-flips` | not set | DRM-backend only; do NOT enable on the wayland backend (causes EVDI fd corruption). |
+
+Restart apollo (`systemctl --user restart apollo`) only if you edit `apps.json` — script changes are picked up on the next stream launch.
+
+---
+
+## Configuration knobs (`~/.config/sunshine/sunshine.conf`)
+
+This fork exposes a few config keys upstream doesn't:
+
+```ini
+# AMD radeonsi only. ffmpeg vaapi `quality` option (0-8). Lower = faster encode at
+# the cost of compression efficiency. -1 = use the codec default (4).
+vaapi_quality = 1
+
+# Force HEVC over AV1. Steam Deck LCD's VCN3 decoder is faster on HEVC than AV1.
+hevc_mode = 2
+av1_mode  = 1
+
+# Host-side global scale factor (percentage). Applies to every app instead of
+# editing each apps.json entry. Per-app `scale-factor` still wins.
+default_scale_factor = 120
+
+# When kwin's pageflip rate on the virtual display is jittery, request 2x the
+# client's target fps from the EVDI EDID so the capture pipeline has a steadier
+# stream. The encoder still emits at the client's requested rate.
+double_refreshrate = true
+```
+
+---
+
+## Diagnostics (when something's off)
+
+### 1. fps stats baked into the log
+
+After patch 0020, while a stream is running you get one line per stage every 5 seconds:
+
+```
+[FPS-EVDI] events=58/s grabs=58/s polls=2014/s avg_grab=423us
+[FPS-CAP]  pushed=58/s avg_copy=872us avg_push=18us wake_event=58/s wake_timeout=0/s
+[FPS-ENC]  popped=58/s encoded=58/s skipped=0/s pop_timeout=0/s avg_convert=509us avg_encode=2403us
+```
+
+Read it as:
+- `events ~ encoded` → 60 fps everywhere → healthy.
+- `events ≈ 30` → kwin half-rate pageflipping (a kwin-side bug, try `KWIN_DRM_USE_MODIFIERS=0`).
+- `skipped > 0` → encoder's variation-threshold drop is firing (often: `double_refreshrate=true` and the capture rate is double the encode rate, which is fine).
+- `avg_encode` close to or above the frame budget (`1_000_000 / fps` µs) → encoder is the cap; lower `vaapi_quality`.
+
+### 2. EVDI-only standalone probe
+
+If you suspect kwin isn't pageflipping into the EVDI device at all, `tests/evdi_pageflip_probe.py` creates a fresh EVDI card, registers a buffer, and counts `evdi_grab_pixels` events per second for N seconds — entirely independent of apollo and Moonlight:
+
+```bash
+python3 tests/evdi_pageflip_probe.py 10
+```
+
+### 3. Monitor recovery
+
+If apollo dies mid-stream, two independent paths bring your monitor back:
+
+- The systemd unit's `ExecStopPost` runs `/usr/bin/apollo-monitor-recovery` even after `SIGKILL`.
+- The next apollo start runs `kscreen::recover_on_startup()` before doing anything else.
+
+If neither fires, the state file lives at `~/.local/state/apollo/saved-primary` and `kscreen-doctor output.<that-name>.enable output.<that-name>.priority.1` will restore manually.
+
+---
+
+## Why CachyOS specifically?
+
+Mostly: that's what was on the test rig. The fork itself is regular Arch-style PKGBUILD + patches and there is nothing CachyOS-specific in the patches. You can build and install on plain Arch the same way. Distros that ship Apollo via a different package manager will need to adapt the `PKGBUILD` install steps but the patch series applies cleanly to upstream MrOz59/Apollo-Linux's `main`.
+
+The name "Apollo-CachyOS" is just the rig of origin.
+
+---
+
+## Limitations / known issues
+
+- **Nvidia path is unvalidated.** The nvenc encoder code is upstream Apollo's and untouched here, but no patch has been written against the Nvidia GPU's interaction with EVDI + kwin specifically. The author has an RTX 5060 Ti incoming; updates will follow.
+- **Static-content fps drop.** kwin only pageflips when something visually changes. On a totally still desktop you may see `events_per_sec` drop below 60 in the FPS stats; the capture loop fills the gap with timeout-driven captures and the encoder is happy. This is by design upstream.
+- **Mesa 26.0 had a VAAPI regression (MR 37884) on RX 9070 XT.** Mesa 26.1 has partial VCN5 fixes that mask the issue but it has not been re-verified end-to-end. If you see encoder failures specific to RDNA4, file an issue with `glxinfo | grep Mesa`.
+- **Gamescope inside KDE Plasma still has minor stutter** in some configurations. Workaround: use the plain "Steam Big Picture" app entry, which gives nearly-identical end-to-end framerate without gamescope's nested compositor layer.
+
+---
+
+## Credits
+
+- [LizardByte / Sunshine](https://github.com/LizardByte/Sunshine) — the original streaming server.
+- [ClassicOldSong / Apollo](https://github.com/ClassicOldSong/Apollo) — the Apollo fork that added per-client virtual displays.
+- [MrOz59 / Apollo-Linux](https://github.com/MrOz59/Apollo-Linux) — the Linux-side EVDI scaffolding this fork patches.
+- [DisplayLink / evdi](https://github.com/DisplayLink/evdi) — the kernel module + libevdi userspace API.
+- [KDE / kscreen-doctor](https://invent.kde.org/plasma/libkscreen) — the kwin output configuration tool.
+
+The PKGBUILD is descended from the AUR `apollo` package by xiota, pointed at MrOz59's upstream instead of LizardByte's.
+
+---
+
+## AI-assisted disclosure
+
+This fork was developed with substantial assistance from an AI coding assistant (Anthropic's Claude / Claude Code). Specifically:
+
+- Patches were drafted, iterated, and audited interactively with Claude.
+- README / commit messages / docstrings are AI-assisted.
+- The end-to-end debugging flow that surfaced the kwin / EVDI / kscreen interaction bugs was done conversationally.
+
+Every patch was reviewed by the author, tested on the rig listed above, and only landed once a real end-to-end behaviour change was observable in Apollo's logs or in Moonlight's stream. The code is human-owned and human-merged; AI was the keyboard.
+
+If you're a reviewer who cares about provenance: each patch in `patches/` has a `Subject:` header summarising what changed and why, in the same English the author and AI iterated on. The commit history (when this is pushed to a remote) reflects the actual human-authored squashes.
+
+---
 
 ## License
 
-GPLv3
+GPL-3.0-only, inherited from upstream Sunshine / Apollo. See [`LICENSE`](LICENSE).

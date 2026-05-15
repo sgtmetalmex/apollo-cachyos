@@ -1,0 +1,63 @@
+Subject: Drop the dead-code ::open() of /dev/dri/cardN that locks kwin out
+
+This is the actual reason patch 0002's kscreen-doctor integration silently
+fails on KDE Plasma Wayland — the upstream MrOz59 createVirtualDisplay does:
+
+    vdinfo.device_index = device;
+    vdinfo.handle = handle;
+    vdinfo.using_evdi = true;
+
+    // Find the DRM card for this EVDI device
+    std::string card_path = "/dev/dri/card" + std::to_string(device);
+    vdinfo.drm_fd = ::open(card_path.c_str(), O_RDWR);
+
+The `vdinfo.drm_fd` field is never read again anywhere in Apollo — it's only
+closed at session teardown. It's pure dead code.
+
+But that plain `open(..., O_RDWR)` on the EVDI DRM card is harmful: when
+Apollo (which already holds the libevdi-opened fd in slave mode) does a
+second, unprivileged open(), DRM treats Apollo as a master candidate on that
+second fd. kwin_wayland then loses the race for DRM master and gets EBUSY
+on every subsequent attempt to open /dev/dri/card0:
+
+    kwin_wayland: Failed to open /dev/dri/card0 device (Device or resource busy)
+    kwin_wayland: Failed to open /dev/dri/card0 device (Device or resource busy)
+    [repeats indefinitely]
+
+Because kwin can never get past the open, it never parses the EDID, never
+constructs a DrmConnector for DVI-I-1, and never reports the new output to
+kscreen. Patch 0002's set-difference polling sees the same DP-3/HDMI-A-1 set
+forever and gives up.
+
+Removing the spurious second open lets kwin in. End-to-end behaviour after
+this patch (confirmed in journal):
+
+    kwin_wayland: Detected connector DVI-I-1 ... connection="Connected"
+    [VDISPLAY/kscreen] poll done. last_seen=[DP-3,HDMI-A-1,DVI-I-1] new_name=[DVI-I-1]
+    [VDISPLAY] Promoting new EVDI output to primary: DVI-I-1 (saved old primary: DP-3)
+
+vdinfo.drm_fd stays at -1; the matching `::close(vdinfo.drm_fd)` in
+removeVirtualDisplay() is already guarded by `if (vdinfo.drm_fd >= 0)` and
+becomes a no-op.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -998,9 +998,15 @@
+           vdinfo.handle = handle;
+           vdinfo.using_evdi = true;
+
+-          // Find the DRM card for this EVDI device
+-          std::string card_path = "/dev/dri/card" + std::to_string(device);
+-          vdinfo.drm_fd = ::open(card_path.c_str(), O_RDWR);
++          // NOTE: do NOT open /dev/dri/cardN here. The upstream code does an
++          // ::open(card_path, O_RDWR) on the EVDI card and stores the fd in
++          // vdinfo.drm_fd, but that fd is never actually read or written —
++          // it's dead code. Worse: that extra open competes with kwin for DRM
++          // master, so kwin can't open the EVDI card (EBUSY) and therefore
++          // never enumerates it as a kscreen output. With this dead open
++          // removed, kwin can open card0 normally, parse the connector, and
++          // surface a new "DVI-I-1" output for kscreen-doctor to find.
++          // vdinfo.drm_fd stays at -1 (initialized at start of this function).
+
+           BOOST_LOG(info) << "[VDISPLAY] Created EVDI virtual display on device " << device;
+

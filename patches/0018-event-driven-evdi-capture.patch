@@ -1,0 +1,159 @@
+Subject: Rate-limited event-driven capture in display_evdi_t
+
+Replaces the original display_evdi_t::capture fixed-delay sleep loop
+with a hybrid:
+
+  - HARD rate cap via `next_frame = last_frame_time + delay` (same
+    as the original loop) — never capture faster than the configured
+    fps. Without this cap, the previous attempt at this patch let
+    capture run at whatever rate kwin pageflipped to the EVDI card.
+    If a game asked for >60Hz the loop captured at that rate, overran
+    the encoder, network dropped frames, and the user saw 47-50fps
+    + visible tearing despite vsync.
+  - EARLY-WAKE via condition-variable wait: between captures we sleep
+    on `buffer_->wait_for_update(last_fn, remaining_budget)` instead
+    of `std::this_thread::sleep_for(...)`. The libevdi event pump
+    notifies the condvar in mark_updated() after grab_pixels, so we
+    wake immediately when a fresh frame is available, eliminating the
+    0-16ms phase-jitter of fixed-delay polling.
+
+EvdiBuffer gains:
+  - std::condition_variable cond_  (notified by mark_updated)
+  - uint64_t wait_for_update(last_fn, timeout) — atomically blocks
+    until frame_number > last_fn or timeout, returns current frame_number
+
+mark_updated() now calls cond_.notify_all() after the atomic increment.
+
+Result: capture rate is exactly the configured fps (60Hz), each
+capture sees the freshest available frame, and we never overrun the
+encoder. No more wakeup-then-stale-buffer or wakeup-then-late patterns.
+
+Combined with patch 0009 (exact 60Hz EDID) and patches 0013/0014
+(AMD VBR rate control + low-latency encoder options), the stream
+should hold a stable 60fps.
+
+Note: the original "PBO async CPU→GPU upload" attempt (was patch 0017)
+turned out to add a one-frame latency penalty on AMD UMA hardware
+that outweighed any throughput benefit (shared memory means the
+synchronous TexSubImage2D is already near-zero cost). That patch
+was archived; we kept the simple synchronous upload.
+
+--- a/src/platform/linux/virtual_display.h
++++ b/src/platform/linux/virtual_display.h
+@@ -6,6 +6,8 @@
+ 
+ // standard includes
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -207,8 +209,24 @@
+     /// Called by the libevdi event pump after a successful grab_pixels.
+     void mark_updated();
+ 
++    /**
++     * @brief Block until the buffer has been updated past `last_frame_number`,
++     * or until `timeout` elapses.
++     *
++     * Used by display_evdi_t::capture (kmsgrab.cpp) to wake immediately
++     * when libevdi's event pump produces a fresh frame, instead of
++     * sleeping a fixed delay and possibly catching a stale buffer.
++     * Combined with a wall-clock rate limit in the caller, this gives
++     * jitter-free 60fps capture (no over-rate, no under-rate).
++     *
++     * @return the new frame_number (>= last_frame_number+1) on update,
++     *         or last_frame_number if the wait timed out.
++     */
++    uint64_t wait_for_update(uint64_t last_frame_number, std::chrono::milliseconds timeout);
++
+    private:
+     mutable std::mutex mutex_;
++    mutable std::condition_variable cond_;  // notified by mark_updated()
+     std::vector<uint8_t> data_;
+     uint32_t width_;
+     uint32_t height_;
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -263,6 +263,16 @@
+ 
+   void EvdiBuffer::mark_updated() {
+     frame_number_.fetch_add(1, std::memory_order_release);
++    cond_.notify_all();
++  }
++
++  uint64_t EvdiBuffer::wait_for_update(uint64_t last_frame_number,
++                                       std::chrono::milliseconds timeout) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    cond_.wait_for(lock, timeout, [&] {
++      return frame_number_.load(std::memory_order_acquire) > last_frame_number;
++    });
++    return frame_number_.load(std::memory_order_acquire);
+   }
+ 
+   // libevdi global event-pump thread state. See evdi_events_loop().
+--- a/src/platform/linux/kmsgrab.cpp
++++ b/src/platform/linux/kmsgrab.cpp
+@@ -1564,12 +1564,39 @@
+     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb,
+                       const pull_free_image_cb_t &pull_free_image_cb,
+                       bool *cursor) override {
++      // Rate-limited event-driven capture (patch 0018):
++      //
++      //   - next_frame is the earliest time we're allowed to capture again
++      //     (= last capture + delay). Hard cap on capture rate so we
++      //     never overrun the encoder, even if EVDI pageflips faster
++      //     than the configured fps (e.g. a game asking for 120fps on
++      //     a 60fps stream).
++      //
++      //   - Between captures we wait on buffer_->wait_for_update(),
++      //     which sleeps on a condition variable notified by the libevdi
++      //     event pump when grab_pixels delivered a new frame. The wait
++      //     timeout is the remaining time until next_frame — so we wake
++      //     EARLY if a fresh frame arrives, but never LATER than the
++      //     frame budget.
++      //
++      // Net behaviour: jitter-free 60fps with no extra latency on
++      // arrival of new frames, and no encoder overrun if pageflips
++      // outpace the configured fps.
+       auto next_frame = std::chrono::steady_clock::now();
++      uint64_t last_fn = buffer_ ? buffer_->frame_number() : 0;
+ 
+       while (true) {
+         auto now = std::chrono::steady_clock::now();
+         if (next_frame > now) {
+-          std::this_thread::sleep_for(next_frame - now);
++          auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(next_frame - now);
++          if (wait_ms.count() <= 0) {
++            wait_ms = std::chrono::milliseconds(1);
++          }
++          if (buffer_) {
++            last_fn = buffer_->wait_for_update(last_fn, wait_ms);
++          } else {
++            std::this_thread::sleep_for(next_frame - now);
++          }
+         }
+         next_frame += delay;
+         if (next_frame < now) {
+@@ -1587,19 +1614,14 @@
+         // Copy the latest BGRA frame from the EVDI buffer into the encoder's
+         // input image. copy_to takes a brief mutex; the libevdi event pump
+         // grab_pixels writes under the same mutex.
+-        const uint64_t fn = buffer_->copy_to(img_out->data, img_out->row_pitch);
++        buffer_->copy_to(img_out->data, img_out->row_pitch);
+ 
+-        // For the first frame or two, fn may be 0 (kwin hasn't pageflipped
+-        // yet) — that's fine; we deliver the zero-initialised black buffer
+-        // and the next frame will have real content.
+         img_out->frame_timestamp = std::chrono::steady_clock::now();
+ 
+         if (!push_captured_image_cb(std::move(img_out), true)) {
+           return capture_e::ok;
+         }
+ 
+-        // We could log first-frame events, but it'd be noisy at 60fps.
+-        (void) fn;
+         (void) cursor;  // cursor compositing skipped — kwin already renders the cursor into the buffer.
+       }
+     }

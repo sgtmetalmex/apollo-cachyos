@@ -1,0 +1,65 @@
+Subject: Fix find_available_evdi_device() to return the actual EVDI DRM card index
+
+MrOz59-Apollo's find_available_evdi_device() incorrectly treats the return
+value of evdi_add_device() as a device index. But libevdi's evdi_add_device()
+writes "1" to /sys/devices/evdi/add and returns the number of bytes written
+(1) on success, NOT the index of the newly created device. The new EVDI card
+actually lands at whichever /dev/dri/cardN minor is free (e.g. card0 when the
+dGPU is at card1).
+
+Result without this patch: Apollo calls evdi_open(1) -> opens /dev/dri/card1
+(usually the dGPU) -> returns NULL -> Apollo falls back to passthrough mode,
+capturing the physical display instead of using a virtual one.
+
+Fix: after add_device(), poll check_device(0..15) until one reports
+EVDI_AVAILABLE, then return that real index. Handles udev's delay in creating
+the new /dev/dri/cardN node.
+
+Also requires that the calling user can write /sys/devices/evdi/{add,remove_all}
+- see the evdi-perms.service systemd unit shipped alongside this package.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -334,20 +334,33 @@
+   }
+ 
+   static int find_available_evdi_device() {
+-    // Find next available EVDI device
++    // First pass: any already-AVAILABLE EVDI device?
+     for (int i = 0; i < 16; i++) {
+-      auto status = evdi.check_device(i);
+-      if (status == EVDI_AVAILABLE) {
++      if (evdi.check_device(i) == EVDI_AVAILABLE) {
+         return i;
+-      } else if (status == EVDI_NOT_PRESENT) {
+-        // Device doesn't exist yet, we can add it
+-        int result = evdi.add_device();
+-        if (result >= 0) {
+-          BOOST_LOG(info) << "[VDISPLAY] Added new EVDI device: " << result;
+-          return result;
++      }
++    }
++    // None available - add one. NOTE: evdi_add_device() returns the number of
++    // bytes written to /sys/devices/evdi/add (1 on success), NOT the device
++    // index. We must rescan check_device() to find which DRM minor the kernel
++    // assigned. Also gives udev a moment to create /dev/dri/cardN.
++    int added = evdi.add_device();
++    if (added < 1) {
++      BOOST_LOG(warning) << "[VDISPLAY] evdi_add_device() failed (returned " << added
++                         << "). Check that the user can write /sys/devices/evdi/add.";
++      return -1;
++    }
++    BOOST_LOG(info) << "[VDISPLAY] Added EVDI device; scanning for new index...";
++    for (int retry = 0; retry < 50; retry++) {
++      for (int i = 0; i < 16; i++) {
++        if (evdi.check_device(i) == EVDI_AVAILABLE) {
++          BOOST_LOG(info) << "[VDISPLAY] New EVDI device available at index " << i;
++          return i;
+         }
+       }
++      usleep(50000);
+     }
++    BOOST_LOG(warning) << "[VDISPLAY] Added EVDI device but no slot reported AVAILABLE after 2.5s";
+     return -1;
+   }
+ 

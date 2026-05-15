@@ -1,0 +1,68 @@
+Subject: scan EVDI device indices 0..63, not 0..15
+
+User had EVDI device IDs accumulate past 16 (`/dev/dri/card16`) after
+several apollo restart cycles. `find_available_evdi_device()`'s loop
+only checked `i < 16`, so the freshly-created EVDI card was invisible
+to apollo. apollo logged:
+
+  [VDISPLAY] Added EVDI device but no slot reported AVAILABLE after 2.5s
+
+and fell back to passthrough mode — capturing the physical monitor
+instead of the virtual display. From moonlight's side this looked like
+"the Gamescope app shows a mirror of my main monitor".
+
+Root cause: the kernel doesn't aggressively recycle DRM minor numbers.
+When older EVDI cards aren't fully cleaned up (e.g. after a SIGKILL on
+apollo, or after several create/destroy cycles), the next minor lands
+at 16, 17, ... Apollo's old hardcoded limit of 16 was an arbitrary
+choice — the search itself is just `evdi_check_device(i)`, a near-zero
+sysfs stat. Raising the limit to 64 covers every realistic accumulation
+without measurable cost.
+
+Diagnostic message now also tells you which indices were searched, so
+if this somehow trips again the user immediately sees what apollo
+looked at.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -752,9 +752,20 @@
+     return 0;
+   }
+
++  // Patch 0022: the EVDI device's DRM minor (i.e. /dev/dri/cardN's N) is NOT
++  // recycled by the kernel — each new `evdi_add_device()` reuses or bumps the
++  // next-free minor. If apollo has restarted after a previous crash that left
++  // a high-numbered card lingering, OR if other DRM devices (USB GPUs, etc.)
++  // have nudged the numbering up, the next EVDI card can land at minor 16+.
++  // The original loop only checked `i < 16`, so the new EVDI was invisible to
++  // apollo and we fell back to passthrough (= physical-monitor mirror).
++  // Bump the search range generously — `evdi_check_device()` is just a
++  // sysfs stat, near-zero cost.
++  static constexpr int EVDI_MAX_SEARCH = 64;
++
+   static int find_available_evdi_device() {
+     // First pass: any already-AVAILABLE EVDI device?
+-    for (int i = 0; i < 16; i++) {
++    for (int i = 0; i < EVDI_MAX_SEARCH; i++) {
+       if (evdi.check_device(i) == EVDI_AVAILABLE) {
+         return i;
+       }
+@@ -770,7 +781,7 @@
+     }
+     BOOST_LOG(info) << "[VDISPLAY] Added EVDI device; scanning for new index...";
+     for (int retry = 0; retry < 50; retry++) {
+-      for (int i = 0; i < 16; i++) {
++      for (int i = 0; i < EVDI_MAX_SEARCH; i++) {
+         if (evdi.check_device(i) == EVDI_AVAILABLE) {
+           BOOST_LOG(info) << "[VDISPLAY] New EVDI device available at index " << i;
+           return i;
+@@ -778,7 +789,8 @@
+       }
+       usleep(50000);
+     }
+-    BOOST_LOG(warning) << "[VDISPLAY] Added EVDI device but no slot reported AVAILABLE after 2.5s";
++    BOOST_LOG(warning) << "[VDISPLAY] Added EVDI device but no slot reported AVAILABLE after 2.5s "
++                       << "(searched indices 0.." << (EVDI_MAX_SEARCH - 1) << ")";
+     return -1;
+   }
+

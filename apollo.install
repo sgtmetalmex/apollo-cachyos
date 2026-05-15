@@ -1,56 +1,56 @@
+ALL_OFF="$(tput sgr0 2>/dev/null || true)"
+YELLOW="$(tput setaf 3 2>/dev/null || true)"
+WHITE="$(tput setaf 7 2>/dev/null || true)"
+
+_warning_root() {
+  printf "${YELLOW}WARNING: ${WHITE}%s${ALL_OFF}\n" "apollo has CAP_SYS_ADMIN for KMS capture"
+}
+
 do_setcap() {
-    setcap cap_sys_admin+p /usr/bin/apollo
+  _warning_root
+  setcap cap_sys_admin+p "$(readlink -f usr/bin/apollo)"
 }
 
 do_udev_reload() {
-    udevadm control --reload-rules
-    udevadm trigger --property-match=DEVNAME=/dev/uinput
-    udevadm trigger --property-match=DEVNAME=/dev/uhid
-    modprobe uinput || true
-    modprobe uhid || true
+  udevadm control --reload-rules
+  udevadm trigger --property-match=DEVNAME=/dev/uinput
+  modprobe uinput || true
 }
 
-load_evdi() {
-    # Carregar módulo EVDI para virtual display
-    modprobe evdi || true
-    
-    # Adicionar ao carregamento automático no boot
-    if [ ! -f /etc/modules-load.d/evdi.conf ]; then
-        echo "evdi" > /etc/modules-load.d/evdi.conf
-    fi
+do_evdi_setup() {
+  # Load EVDI module now and configure persistent auto-load on boot.
+  modprobe evdi || true
+  if [ ! -f /etc/modules-load.d/evdi.conf ]; then
+    printf "evdi\n" > /etc/modules-load.d/evdi.conf
+  fi
+  # Open up /sys/devices/evdi/{add,remove_all} to the video group so Apollo
+  # (running as your user) can create virtual displays. systemctl daemon-reload
+  # picks up the new unit file; enable+start makes it active now and at boot.
+  systemctl daemon-reload || true
+  systemctl enable --now evdi-perms.service || true
+}
+
+do_evdi_teardown() {
+  systemctl disable --now evdi-perms.service 2>/dev/null || true
 }
 
 post_install() {
-    do_setcap
-    do_udev_reload
-    load_evdi
-    
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║          Apollo instalado com sucesso!                   ║"
-    echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  • Virtual display (EVDI) configurado automaticamente    ║"
-    echo "║  • Capabilities para KMS capture configuradas            ║"
-    echo "║                                                          ║"
-    echo "║  Execute 'apollo' para iniciar o servidor                ║"
-    echo "║  Acesse https://localhost:47990 para configurar          ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo ""
+  do_setcap
+  do_udev_reload
+  do_evdi_setup
+  printf "\n"
+  printf "==> Apollo installed. EVDI virtual display module loaded and set to auto-load on boot.\n"
+  printf "==> Start the server:    systemctl --user enable --now apollo\n"
+  printf "==> Open the web UI at:  https://localhost:47990  (accept the self-signed cert; create admin user)\n"
+  printf "\n"
 }
 
 post_upgrade() {
-    do_setcap
-    do_udev_reload
-    load_evdi
-    
-    echo ""
-    echo "==> Apollo atualizado com sucesso!"
-    echo ""
+  do_setcap
+  do_udev_reload
+  do_evdi_setup
 }
 
 pre_remove() {
-    # Remover configuração de autoload do evdi se foi criada por nós
-    if [ -f /etc/modules-load.d/evdi.conf ]; then
-        rm -f /etc/modules-load.d/evdi.conf
-    fi
+  do_evdi_teardown
 }

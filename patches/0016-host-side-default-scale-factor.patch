@@ -1,0 +1,99 @@
+Subject: config: add host-side default_scale_factor so user sets it once
+
+Apollo's existing scale_factor flow (before this patch):
+
+  1. Moonlight client URL arg `scaleFactor=N` → launch_session->scale_factor
+     (defaults to 100 — most moonlight clients never pass this)
+  2. apps.json per-app `scale-factor` field → overrides launch_session
+     value if != 100
+  3. process.cpp uses whichever survives
+
+Result: there is NO host-side way to say "use 150% for every game I have
+configured." The user has to edit each app's scale-factor individually,
+and a newly added app starts at 100 (the editForm default). User
+feedback:
+
+  "i dont like that i have to set the resolution to the max i set on the
+   scale factor every game, i would like that it auto uses the maximum
+   one"
+
+This patch adds a host config field `default_scale_factor` (config.h
+video_t, registered in config.cpp at the same precedence level as `qp`,
+`hevc_mode`, etc.). Reading order in process.cpp becomes:
+
+   1. apps.json per-app scale-factor (if != 100)    — highest priority
+   2. client URL scaleFactor (if != 100)
+   3. host config default_scale_factor               — NEW global default
+   4. 100 (no scaling)                              — fallback
+
+User sets `default_scale_factor = 150` in `~/.config/sunshine/sunshine.conf`
+once, every game now renders at 1.5x resolution and downsamples to the
+client. Per-app overrides still work for anything they want different.
+
+Validated range 20-200% (matches the web UI slider patch 0010 enabled).
+Default value 100 keeps existing behaviour for everyone who doesn't set
+it. Backwards-compatible.
+
+This patch deliberately does NOT add a web UI input — `sunshine.conf`
+is the supported config path and the existing per-app slider already
+exists for game-specific tweaks. Adding a global UI control would
+require Vue + confighttp.cpp + i18n locale changes for marginal value.
+
+--- a/src/config.h
++++ b/src/config.h
+@@ -31,6 +31,13 @@
+ 
+     int min_threads;  // Minimum number of threads/slices for CPU encoding
+ 
++    // Host-side default resolution scale factor applied when neither the
++    // client nor the per-app config requested anything else. Percentage,
++    // 100 = unchanged. Lets the user set ONE number here and have it
++    // apply to every app, instead of editing each app's scale-factor
++    // field individually. Per-app values != 100 still win.
++    int default_scale_factor;
++
+     struct {
+       std::string sw_preset;
+       std::string sw_tune;
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -447,6 +447,9 @@
+     0,  // av1_mode
+ 
+     2,  // min_threads
++
++    100,  // default_scale_factor (100 = no host-side scaling; per-app override still applies)
++
+     {
+       "superfast"s,  // preset
+       "zerolatency"s,  // tune
+@@ -1111,6 +1114,7 @@
+     int_between_f(vars, "hevc_mode", video.hevc_mode, {0, 3});
+     int_between_f(vars, "av1_mode", video.av1_mode, {0, 3});
+     int_f(vars, "min_threads", video.min_threads);
++    int_between_f(vars, "default_scale_factor", video.default_scale_factor, {20, 200});
+     string_f(vars, "sw_preset", video.sw.sw_preset);
+     if (!video.sw.sw_preset.empty()) {
+       video.sw.svtav1_preset = sw::svtav1_preset_from_view(video.sw.sw_preset);
+--- a/src/process.cpp
++++ b/src/process.cpp
+@@ -197,9 +197,19 @@
+     uint32_t render_width = client_width;
+     uint32_t render_height = client_height;
+ 
++    // Resolve effective scale_factor in priority order:
++    //   1. Per-app config (apps.json scale-factor != 100)  — explicit per-game
++    //   2. Client-requested (launch_session->scale_factor != 100) — from URL arg
++    //   3. Host-side default (config::video.default_scale_factor) — global, set in sunshine.conf
++    //   4. 100 (no scaling)
+     int scale_factor = launch_session->scale_factor;
+     if (_app.scale_factor != 100) {
+       scale_factor = _app.scale_factor;
++    } else if (scale_factor == 100 && config::video.default_scale_factor != 100) {
++      // Neither client nor per-app overrode; fall back to the global default.
++      // The user sets this ONCE in sunshine.conf (default_scale_factor = 150)
++      // and it applies to every game automatically.
++      scale_factor = config::video.default_scale_factor;
+     }
+ 
+     if (scale_factor != 100) {

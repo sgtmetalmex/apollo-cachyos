@@ -1,0 +1,691 @@
+Subject: EVDI CPU-buffer capture backend (display_evdi_t) + libevdi event pump + cleanup
+
+This is the patch that finally makes Apollo's stream show the *virtual* desktop
+content instead of either mirroring the physical monitor or crashing on the
+EVDI card.
+
+## The architectural problem patches 0005 + 0006 (archived) couldn't solve
+
+Apollo's existing KMS capture pipeline (kmsgrab.cpp display_ram_t /
+display_vram_t) is built around real GPU framebuffers:
+   open(/dev/dri/cardN) -> gbm_create_device(fd) -> eglCreateImage(dma-buf)
+   -> glGetTextureSubImage -> img->data
+That entire chain assumes the card is a GPU with DRI/render support. An EVDI
+card has no render node and isn't a real GPU — `gbm_create_device` on it
+SIGSEGVs inside libgallium's `driCreateNewScreen3` (graphify graph confirms
+the crash site as `display_ram_t::init`).
+
+Patches 0005 + 0006 tried to make EVDI work through that same pipeline.
+0005 added the libevdi event pump (register_buffer / request_update /
+handle_events / grab_pixels) so kwin's pageflips would complete. 0006 cleaned
+up stale `/dev/dri/cardN` between runs. Both fixed real bugs but they kept
+Apollo on the GBM/EGL path, and that path is what crashes mesa.
+
+## The fix
+
+Build a parallel capture lane that NEVER touches the EVDI card via mesa:
+
+  display_evdi_t (this patch) ----- evdi_grab_pixels ----- AMD GPU (va_ram_t)
+  ^                                                       ^
+  reads CPU buffer that libevdi      uploads CPU pixels to a VA surface using
+  fills from kwin's pageflips        /dev/dri/renderD128 (the AMD render node)
+
+Apollo already has a CPU-pixels-in lane: `va::make_avcodec_encode_device(w, h,
+vram=false)` returns `va_ram_t`, which calls `egl::sws_t::load_ram` to upload
+host BGRA8888 onto a VA surface. We reuse that lane unchanged.
+
+The graphify graph surfaced the critical bridge:
+
+   va_ram_t  --semantically_similar_to-->  struct evdi_buffer (CPU pixel buffer)
+   copy_primary_pixels (kernel memcpy) -- semantically_similar_to --> display_ram_t::snapshot
+
+i.e. the data shapes already match (BGRA8888 packed, width*4 stride). The
+EVDI driver's mode_changed notification confirms `AR24 little-endian` = BGRA
+in memory.
+
+## Components
+
+1. **VDISPLAY::EvdiBuffer** (virtual_display.h) — a thread-safe CPU pixel
+   buffer with `copy_to(dst, stride)` for readers and `mark_updated()` for
+   the event pump. shared_ptr-managed so the capture side can outlive a
+   removeVirtualDisplay race.
+
+2. **VDISPLAY::getEvdiBuffer(name)** — name-keyed lookup. Returns the
+   shared_ptr for "VIRTUAL-XXXX" display names, nullptr otherwise.
+
+3. **evdi_events_loop** (virtual_display.cpp) — single global thread that
+   polls every active EVDI handle's event fd, dispatches `evdi_handle_events`,
+   calls `evdi_grab_pixels` (the ioctl that releases the kernel's queued
+   vblank), bumps the buffer's frame_number, re-arms `evdi_request_update`.
+   2ms tick = under half a 240Hz frame, low CPU.
+
+4. **cleanup_stale_evdi_devices** (virtual_display.cpp) — writes "1" to
+   /sys/devices/evdi/remove_all on driver open AND close. Otherwise a
+   leftover EVDI card from a crashed prior run would be picked up by Apollo's
+   startup KMS probe and crash gbm_create_device.
+
+5. **display_evdi_t** (kmsgrab.cpp) — the new capture class. Inherits from
+   platf::display_t directly (NOT kms::display_t — we don't want any of the
+   GBM/EGL setup). init() looks up the EvdiBuffer, capture()/snapshot loop
+   memcpys it into img_out->data. make_avcodec_encode_device returns va_ram_t.
+   alloc_img returns a kms_img_t with a CPU heap buffer.
+
+6. **kms_display() factory** (kmsgrab.cpp) — checks for "VIRTUAL-" prefix in
+   display_name and instantiates display_evdi_t. Falls through to the
+   existing display_ram_t / display_vram_t path on failure or for non-virtual
+   displays, so streaming the physical monitor still works exactly as before.
+
+7. **kms_display_names() startup probe** (kmsgrab.cpp) — skips any /dev/dri/cardN
+   whose `device/driver` symlink points at `evdi`. Defense against stale
+   cards bypassing cleanup_stale_evdi_devices (e.g. if a non-Apollo process
+   created an EVDI card).
+
+## End-to-end flow
+
+1. Steam Deck connects -> session manager calls VDISPLAY::createVirtualDisplay
+   -> patch 1's fixed find_available_evdi_device, patch 3's no-spurious-open,
+   patch 2's kscreen promote.
+2. createVirtualDisplay now ALSO allocates an EvdiBuffer (width*height*4
+   bytes), calls evdi_register_buffer + evdi_request_update.
+3. Patch 4 lets kwin enumerate the new DRM connector. kwin starts rendering.
+4. Every kwin pageflip queues a vblank in the kernel. The evdi_events_loop
+   thread polls, dispatches, calls grab_pixels -> kernel copies the rendered
+   GBM buffer into our EvdiBuffer -> releases the queued vblank -> kwin's
+   pageflip completes -> kwin draws the next frame. (No more "Pageflip timed
+   out!" spam.)
+5. Apollo's video session calls kms_display(VIRTUAL-XXXX) -> the factory
+   returns display_evdi_t (no GBM, no crash).
+6. display_evdi_t::capture loop pulls an empty img from the pool, copy_to's
+   the EvdiBuffer into img->data, pushes it to the encoder.
+7. va_ram_t uploads the BGRA bytes via egl::sws_t::load_ram onto a VA surface
+   on the AMD GPU (renderD128), the VAAPI encoder produces H264/HEVC/AV1,
+   moonlight on the Steam Deck shows the virtual desktop.
+
+## What's NOT in this patch
+
+- xdg-desktop-portal / PipeWire screencast. Would be the "cleanest" architecture
+  but requires substantial new code in Apollo and isn't necessary.
+- Cursor compositing. kwin renders the cursor into the framebuffer that EVDI
+  shadows, so it shows up naturally. display_evdi_t ignores the `cursor` flag.
+
+--- a/src/platform/linux/virtual_display.h
++++ b/src/platform/linux/virtual_display.h
+@@ -5,7 +5,11 @@
+ #pragma once
+ 
+ // standard includes
++#include <atomic>
++#include <cstdint>
+ #include <functional>
++#include <memory>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ 
+@@ -147,4 +151,75 @@
+    */
+   int getEvdiCardIndex(const std::string &displayName);
+ 
++  // ============================================================================
++  // EVDI CPU-pixel-buffer capture API (added by patch 0007)
++  //
++  // Apollo's existing KMS capture pipeline (kmsgrab.cpp display_ram_t /
++  // display_vram_t) calls gbm_create_device on /dev/dri/cardN, which SIGSEGVs
++  // inside libgallium when N is an EVDI card (no render node, no DRI).
++  // Instead, kmsgrab.cpp's display_evdi_t reads the CPU pixel buffer that
++  // libevdi fills via evdi_grab_pixels — exposed here.
++  // ============================================================================
++
++  /**
++   * @brief CPU-side BGRA8888 pixel buffer filled by the libevdi event pump.
++   *
++   * The buffer is sized once at virtual-display creation (width*height*4 bytes)
++   * and reused for every frame. A worker thread in virtual_display.cpp calls
++   * evdi_grab_pixels into this buffer whenever kwin pageflips to the EVDI
++   * card; that ioctl is also what releases the kernel-side queued vblank,
++   * so without this consumer kwin's pageflips would time out.
++   *
++   * Lifetime: shared_ptr — both VirtualDisplayInfo and the capture-side
++   * display_evdi_t hold references. When the virtual display is removed and
++   * the capture stops, the last reference drops and the buffer is freed.
++   * Hold the mutex (via copy_to) while reading to avoid tearing.
++   */
++  class EvdiBuffer {
++   public:
++    EvdiBuffer(uint32_t w, uint32_t h);
++    ~EvdiBuffer() = default;
++    EvdiBuffer(const EvdiBuffer &) = delete;
++    EvdiBuffer &operator=(const EvdiBuffer &) = delete;
++
++    uint32_t width() const { return width_; }
++    uint32_t height() const { return height_; }
++    uint32_t stride() const { return width_ * 4; }
++    uint64_t frame_number() const { return frame_number_.load(std::memory_order_acquire); }
++
++    /**
++     * @brief Raw buffer pointer for libevdi to write into.
++     * Caller must NOT touch this concurrently with copy_to() or the event
++     * pump — it's intended only for evdi_register_buffer wiring inside
++     * virtual_display.cpp.
++     */
++    void *raw_buffer() { return data_.data(); }
++
++    /**
++     * @brief Copy the latest BGRA8888 frame into dst.
++     * @param dst        destination pointer, at least (dst_stride * height) bytes.
++     * @param dst_stride bytes per row in dst (usually = stride()).
++     * @return The frame number copied. Zero means the buffer has never been
++     *         updated yet (caller should treat as "black frame, retry next tick").
++     */
++    uint64_t copy_to(uint8_t *dst, uint32_t dst_stride) const;
++
++    /// Called by the libevdi event pump after a successful grab_pixels.
++    void mark_updated();
++
++   private:
++    mutable std::mutex mutex_;
++    std::vector<uint8_t> data_;
++    uint32_t width_;
++    uint32_t height_;
++    std::atomic<uint64_t> frame_number_ {0};
++  };
++
++  /**
++   * @brief Look up the EVDI capture buffer by display name (e.g. "VIRTUAL-XXXX").
++   * @return shared_ptr to the buffer, or nullptr if no matching virtual
++   *         display exists or it's in passthrough (non-EVDI) mode.
++   */
++  std::shared_ptr<EvdiBuffer> getEvdiBuffer(const std::string &display_name);
++
+ }  // namespace VDISPLAY
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -30,6 +30,7 @@
+ 
+ // platform includes
+ #include <fcntl.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ #include <xf86drm.h>
+@@ -222,11 +223,53 @@
+     int drm_fd;            // DRM fd for card
+     bool active;
+     bool using_evdi;       // true if using EVDI, false if passthrough
++
++    // EVDI CPU-pixel-buffer plumbing (patch 0007).
++    // The buffer is the destination libevdi writes into via evdi_grab_pixels,
++    // and the source kmsgrab.cpp's display_evdi_t reads from. shared_ptr so
++    // the capture side can keep the buffer alive briefly even if the user
++    // disconnects mid-frame.
++    std::shared_ptr<EvdiBuffer> evdi_buf;
++    int evdi_buf_id = 0;  // id passed to evdi_register_buffer (0 = none registered)
+   };
+ 
+   static std::map<std::string, VirtualDisplayInfo> virtual_displays;
+ 
+   // ============================================================================
++  // EvdiBuffer implementation (declared in virtual_display.h)
++  // ============================================================================
++
++  EvdiBuffer::EvdiBuffer(uint32_t w, uint32_t h):
++      width_ {w}, height_ {h} {
++    data_.assign(static_cast<size_t>(w) * h * 4, 0);
++  }
++
++  uint64_t EvdiBuffer::copy_to(uint8_t *dst, uint32_t dst_stride) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    const uint32_t row_bytes = width_ * 4;
++    const uint32_t copy_stride = std::min(dst_stride, row_bytes);
++    if (copy_stride == row_bytes && dst_stride == row_bytes) {
++      // Fast path: contiguous copy.
++      std::memcpy(dst, data_.data(), row_bytes * height_);
++    } else {
++      // Per-row copy honoring dst_stride.
++      const uint8_t *src = data_.data();
++      for (uint32_t y = 0; y < height_; ++y) {
++        std::memcpy(dst + y * dst_stride, src + y * row_bytes, copy_stride);
++      }
++    }
++    return frame_number_.load(std::memory_order_acquire);
++  }
++
++  void EvdiBuffer::mark_updated() {
++    frame_number_.fetch_add(1, std::memory_order_release);
++  }
++
++  // libevdi global event-pump thread state. See evdi_events_loop().
++  static std::atomic<bool> evdi_events_running {false};
++  static std::thread evdi_events_thread;
++
++  // ============================================================================
+   // KDE / kscreen-doctor integration
+   //
+   // EVDI alone is not enough on KDE Plasma Wayland: kwin detects the new
+@@ -830,6 +873,100 @@
+   // Public API Implementation
+   // ============================================================================
+ 
++  // Wipe leftover EVDI /dev/dri/cardN entries from a prior Apollo run that
++  // didn't clean up. evdi_disconnect() does not remove the card file; only
++  // writing "1" to /sys/devices/evdi/remove_all does. Without this, Apollo's
++  // startup KMS encoder probe (kmsgrab.cpp kms_display_names) can find a
++  // stale EVDI card and crash mesa inside gbm_create_device. evdi-perms.service
++  // chowns this sysfs path to group=video mode 0220 so Apollo can write to
++  // it without CAP_DAC_OVERRIDE.
++  static void cleanup_stale_evdi_devices() {
++    const char *path = "/sys/devices/evdi/remove_all";
++    int fd = ::open(path, O_WRONLY | O_CLOEXEC);
++    if (fd < 0) {
++      BOOST_LOG(debug) << "[VDISPLAY] " << path << " unavailable for cleanup: " << strerror(errno);
++      return;
++    }
++    if (::write(fd, "1", 1) < 0) {
++      BOOST_LOG(debug) << "[VDISPLAY] " << path << " write failed: " << strerror(errno);
++    } else {
++      BOOST_LOG(info) << "[VDISPLAY] Cleared any stale EVDI /dev/dri/cardN entries.";
++    }
++    ::close(fd);
++  }
++
++  // Drive the libevdi event pump for every active EVDI virtual display.
++  // Kernel-side contract (see evdi_painter.c):
++  //   - kwin issues an atomic page-flip on the EVDI card.
++  //   - The kernel sees is_connected=true and num_dirts>0, QUEUES the vblank.
++  //   - The kernel emits an update_ready event on the libevdi fd.
++  //   - We must call evdi_handle_events (dispatches our no-op callback),
++  //     then evdi_grab_pixels (the ioctl that copies the kernel's shadow into
++  //     our registered buffer AND releases the queued vblank, so kwin's
++  //     pageflip completes and kwin can submit the next frame).
++  //   - We then re-arm with evdi_request_update for the next cycle.
++  // Without this loop, kwin spams "Pageflip timed out!" every ~1s, stops
++  // rendering, and Apollo's capture sees only the zero-initialised buffer.
++  static void evdi_events_loop() {
++    evdi_event_context ctx {};
++    ctx.update_ready_handler = [](int /*buffer_id*/, void * /*user_data*/) {
++      // No-op: we drain pixels below via evdi_grab_pixels regardless.
++    };
++    ctx.user_data = nullptr;
++
++    constexpr int MAX_RECTS = 16;
++    evdi_rect rects[MAX_RECTS];
++
++    while (evdi_events_running) {
++      // Snapshot active EVDI handles + buf_ids + buffers under the lock,
++      // release before calling into libevdi.
++      struct entry_t {
++        evdi_handle handle;
++        int buf_id;
++        std::shared_ptr<EvdiBuffer> buffer;
++      };
++      std::vector<entry_t> active;
++      {
++        std::lock_guard<std::mutex> lock(vdisplay_mutex);
++        active.reserve(virtual_displays.size());
++        for (auto &[guid, vdinfo] : virtual_displays) {
++          if (vdinfo.using_evdi && vdinfo.handle && vdinfo.evdi_buf_id > 0) {
++            active.push_back({vdinfo.handle, vdinfo.evdi_buf_id, vdinfo.evdi_buf});
++          }
++        }
++      }
++
++      for (const auto &e : active) {
++        const int fd = evdi.get_event_ready(e.handle);
++        if (fd < 0) {
++          continue;
++        }
++        struct pollfd pfd {};
++        pfd.fd = fd;
++        pfd.events = POLLIN;
++        if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
++          // We have an event. Dispatch (no-op callback), then drain the
++          // dirty rectangles — that ioctl is what releases the kernel's
++          // queued vblank so kwin's pageflip can complete.
++          evdi.handle_events(e.handle, &ctx);
++
++          int num_rects = MAX_RECTS;
++          evdi.grab_pixels(e.handle, rects, &num_rects);
++
++          // The kernel just copied a fresh frame into our registered buffer.
++          // Bump the frame counter so the capture side knows there's new data.
++          if (e.buffer) {
++            e.buffer->mark_updated();
++          }
++        }
++        // Always (re)arm the next update. Cheap — kernel just sets a flag.
++        evdi.request_update(e.handle, e.buf_id);
++      }
++
++      usleep(2000);  // 2ms — under half a 240Hz frame, low CPU.
++    }
++  }
++
+   DRIVER_STATUS openVDisplayDevice() {
+     std::lock_guard<std::mutex> lock(vdisplay_mutex);
+ 
+@@ -839,6 +976,11 @@
+ 
+     BOOST_LOG(info) << "[VDISPLAY] Initializing Linux virtual display driver...";
+ 
++    // Wipe stale EVDI cards from any prior crashed run BEFORE Apollo's
++    // encoder probe scans /dev/dri/* — otherwise mesa gbm_create_device
++    // SIGSEGVs on the orphaned card.
++    cleanup_stale_evdi_devices();
++
+     // Try to load EVDI library
+     evdi_available = load_evdi_library();
+ 
+@@ -853,6 +995,14 @@
+ 
+     if (evdi_available) {
+       BOOST_LOG(info) << "[VDISPLAY] EVDI available - real virtual displays supported!";
++      // Spin up the global event pump so kwin's pageflips on any EVDI card
++      // we create get ACKed via grab_pixels + the buffer stays fresh for
++      // display_evdi_t::snapshot to read.
++      if (!evdi_events_running) {
++        evdi_events_running = true;
++        evdi_events_thread = std::thread(evdi_events_loop);
++        BOOST_LOG(info) << "[VDISPLAY] EVDI event pump thread started.";
++      }
+     } else {
+       BOOST_LOG(warning) << "[VDISPLAY] EVDI not available - using passthrough mode.";
+       BOOST_LOG(warning) << "[VDISPLAY] The stream will capture the physical display.";
+@@ -865,6 +1015,16 @@
+   }
+ 
+   void closeVDisplayDevice() {
++    // Stop the event pump first; join *outside* vdisplay_mutex because the
++    // loop itself acquires the mutex.
++    if (evdi_events_running) {
++      evdi_events_running = false;
++      if (evdi_events_thread.joinable()) {
++        evdi_events_thread.join();
++      }
++      BOOST_LOG(info) << "[VDISPLAY] EVDI event pump thread stopped.";
++    }
++
+     std::lock_guard<std::mutex> lock(vdisplay_mutex);
+ 
+     BOOST_LOG(info) << "[VDISPLAY] Closing Linux virtual display driver...";
+@@ -879,6 +1039,10 @@
+     for (auto &[guid, vdinfo] : virtual_displays) {
+       if (vdinfo.active) {
+         if (vdinfo.using_evdi && vdinfo.handle) {
++          if (vdinfo.evdi_buf_id > 0) {
++            evdi.unregister_buffer(vdinfo.handle, vdinfo.evdi_buf_id);
++            vdinfo.evdi_buf_id = 0;
++          }
+           evdi.disconnect(vdinfo.handle);
+           evdi.close(vdinfo.handle);
+         }
+@@ -889,6 +1053,10 @@
+     }
+     virtual_displays.clear();
+ 
++    // Actually remove the /dev/dri/cardN devices we created so the next
++    // Apollo startup sees a clean /dev/dri/.
++    cleanup_stale_evdi_devices();
++
+     // Unload EVDI library
+     unload_evdi_library();
+ 
+@@ -987,6 +1155,7 @@
+     vdinfo.drm_fd = -1;
+     vdinfo.active = true;
+     vdinfo.using_evdi = false;
++    vdinfo.evdi_buf_id = 0;  // 0 = no libevdi buffer registered yet
+ 
+     if (evdi_available) {
+       // Snapshot kscreen outputs AND the current priority-1 output BEFORE
+@@ -1028,6 +1197,31 @@
+ 
+           BOOST_LOG(info) << "[VDISPLAY] Created EVDI virtual display on device " << device;
+ 
++          // Register a CPU buffer with libevdi and arm the first update.
++          // The global evdi_events_loop (started in openVDisplayDevice) will
++          // call grab_pixels into this buffer whenever kwin pageflips. The
++          // capture side (kmsgrab.cpp display_evdi_t) holds a shared_ptr to
++          // the same EvdiBuffer and memcpys its content into the encoder's
++          // input image. Without this registration: kwin pageflips would
++          // time out, kwin would stop rendering, the buffer would stay zero.
++          {
++            vdinfo.evdi_buf = std::make_shared<EvdiBuffer>(width, height);
++            evdi_buffer ebuf {};
++            ebuf.id = 1;
++            ebuf.buffer = vdinfo.evdi_buf->raw_buffer();
++            ebuf.width = static_cast<int>(width);
++            ebuf.height = static_cast<int>(height);
++            ebuf.stride = static_cast<int>(vdinfo.evdi_buf->stride());
++            ebuf.rects = nullptr;
++            ebuf.rect_count = 0;
++            evdi.register_buffer(handle, ebuf);
++            vdinfo.evdi_buf_id = ebuf.id;
++            evdi.request_update(handle, vdinfo.evdi_buf_id);
++            BOOST_LOG(info) << "[VDISPLAY] Registered libevdi buffer id=" << vdinfo.evdi_buf_id
++                            << " (" << width << "x" << height << ", "
++                            << (vdinfo.evdi_buf->stride() * height) << " bytes)";
++          }
++
+           // Ask KDE to actually USE the new output. Without this kwin leaves
+           // it disabled, no fb gets attached to its DRM planes, and Apollo's
+           // KMS screencast falls through to the physical display.
+@@ -1069,6 +1263,12 @@
+     BOOST_LOG(info) << "[VDISPLAY] Removing virtual display: " << vdinfo.name;
+ 
+     if (vdinfo.using_evdi && vdinfo.handle) {
++      // Unregister the libevdi buffer first so the kernel won't try to
++      // write into freed memory once vdinfo.evdi_buf drops its last ref.
++      if (vdinfo.evdi_buf_id > 0) {
++        evdi.unregister_buffer(vdinfo.handle, vdinfo.evdi_buf_id);
++        vdinfo.evdi_buf_id = 0;
++      }
+       evdi.disconnect(vdinfo.handle);
+       evdi.close(vdinfo.handle);
+       kscreen::on_evdi_removed();
+@@ -1222,4 +1422,14 @@
+     return -1;
+   }
+ 
++  std::shared_ptr<EvdiBuffer> getEvdiBuffer(const std::string &display_name) {
++    std::lock_guard<std::mutex> lock(vdisplay_mutex);
++    for (const auto &[guid, vdinfo] : virtual_displays) {
++      if (vdinfo.name == display_name && vdinfo.using_evdi && vdinfo.evdi_buf) {
++        return vdinfo.evdi_buf;  // bump shared_ptr refcount
++      }
++    }
++    return nullptr;
++  }
++
+ }  // namespace VDISPLAY
+--- a/src/platform/linux/kmsgrab.cpp
++++ b/src/platform/linux/kmsgrab.cpp
+@@ -27,6 +27,7 @@
+ #include "src/utility.h"
+ #include "src/video.h"
+ #include "vaapi.h"
++#include "virtual_display.h"
+ #include "wayland.h"
+ 
+ using namespace std::literals;
+@@ -1507,7 +1508,161 @@
+ 
+   }  // namespace kms
+ 
++  // ============================================================================
++  // display_evdi_t — EVDI CPU-buffer capture backend (patch 0007)
++  //
++  // Apollo's normal kmsgrab path (display_ram_t / display_vram_t) opens
++  // /dev/dri/cardN, calls gbm_create_device on it, sets up EGL, and reads
++  // framebuffer dma-bufs via drmPrimeHandleToFD + eglCreateImage. That entire
++  // chain assumes the card is a real GPU.
++  //
++  // An EVDI card is NOT a real GPU. It has no render node. gbm_create_device
++  // on it SIGSEGVs inside libgallium's driCreateNewScreen3.
++  //
++  // This class is the EVDI-specific replacement. It:
++  //   - Looks up the active VDISPLAY virtual display by name.
++  //   - Grabs a shared_ptr to its EvdiBuffer (a CPU BGRA8888 buffer the
++  //     libevdi event-pump thread fills from kwin's pageflips).
++  //   - In snapshot(), memcpys the buffer into the encoder's input image —
++  //     no GBM, no EGL, no dma-buf, no GPU touch on the EVDI side.
++  //   - For VAAPI hardware encoding, it uses the SAME existing va_ram_t
++  //     path (which internally opens /dev/dri/renderD128 on the actual AMD
++  //     GPU). That path uploads CPU pixels onto a VA surface via
++  //     egl::sws_t::load_ram and hands the result to the encoder.
++  // ============================================================================
++
++  class display_evdi_t: public platf::display_t {
++  public:
++    display_evdi_t(mem_type_e mem_type):
++        mem_type_ {mem_type} {
++    }
++
++    int init(const std::string &display_name, const ::video::config_t &config) {
++      delay = std::chrono::nanoseconds {1s} / config.framerate;
++
++      buffer_ = VDISPLAY::getEvdiBuffer(display_name);
++      if (!buffer_) {
++        BOOST_LOG(error) << "[KMS/EVDI] no EVDI buffer registered for ["sv << display_name
++                         << "] — was VDISPLAY::createVirtualDisplay called first?"sv;
++        return -1;
++      }
++      display_name_ = display_name;
++
++      width = buffer_->width();
++      height = buffer_->height();
++      env_width = width;
++      env_height = height;
++      offset_x = 0;
++      offset_y = 0;
++
++      BOOST_LOG(info) << "[KMS/EVDI] capturing ["sv << display_name
++                      << "] " << width << "x" << height
++                      << " via CPU buffer (no GBM/EGL on EVDI card)";
++      return 0;
++    }
++
++    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb,
++                      const pull_free_image_cb_t &pull_free_image_cb,
++                      bool *cursor) override {
++      auto next_frame = std::chrono::steady_clock::now();
++
++      while (true) {
++        auto now = std::chrono::steady_clock::now();
++        if (next_frame > now) {
++          std::this_thread::sleep_for(next_frame - now);
++        }
++        next_frame += delay;
++        if (next_frame < now) {
++          next_frame = now + delay;
++        }
++
++        std::shared_ptr<platf::img_t> img_out;
++        if (!pull_free_image_cb(img_out)) {
++          return capture_e::interrupted;
++        }
++        if (!img_out) {
++          return capture_e::interrupted;
++        }
++
++        // Copy the latest BGRA frame from the EVDI buffer into the encoder's
++        // input image. copy_to takes a brief mutex; the libevdi event pump
++        // grab_pixels writes under the same mutex.
++        const uint64_t fn = buffer_->copy_to(img_out->data, img_out->row_pitch);
++
++        // For the first frame or two, fn may be 0 (kwin hasn't pageflipped
++        // yet) — that's fine; we deliver the zero-initialised black buffer
++        // and the next frame will have real content.
++        img_out->frame_timestamp = std::chrono::steady_clock::now();
++
++        if (!push_captured_image_cb(std::move(img_out), true)) {
++          return capture_e::ok;
++        }
++
++        // We could log first-frame events, but it'd be noisy at 60fps.
++        (void) fn;
++        (void) cursor;  // cursor compositing skipped — kwin already renders the cursor into the buffer.
++      }
++    }
++
++    std::shared_ptr<img_t> alloc_img() override {
++      auto img = std::make_shared<kms::kms_img_t>();
++      img->width = width;
++      img->height = height;
++      img->pixel_pitch = 4;
++      img->row_pitch = img->pixel_pitch * width;
++      img->data = new std::uint8_t[height * img->row_pitch];
++      std::memset(img->data, 0, height * img->row_pitch);
++      return img;
++    }
++
++    int dummy_img(platf::img_t * /*img*/) override {
++      return 0;
++    }
++
++    std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
++#ifdef SUNSHINE_BUILD_VAAPI
++      if (mem_type_ == mem_type_e::vaapi) {
++        // va_ram_t path: opens /dev/dri/renderD128 (the AMD GPU's render
++        // node) internally and uploads CPU pixels via egl::sws_t::load_ram.
++        return va::make_avcodec_encode_device(width, height, false);
++      }
++#endif
++#ifdef SUNSHINE_BUILD_CUDA
++      if (mem_type_ == mem_type_e::cuda) {
++        return cuda::make_avcodec_encode_device(width, height, false);
++      }
++#endif
++      // Software encoder fallback: ffmpeg accepts the raw BGRA frame.
++      return std::make_unique<avcodec_encode_device_t>();
++    }
++
++    bool is_codec_supported(std::string_view name, const ::video::config_t & /*config*/) override {
++      // EVDI capture supports any codec the encoder backend supports.
++      (void) name;
++      return true;
++    }
++
++  private:
++    mem_type_e mem_type_;
++    std::shared_ptr<VDISPLAY::EvdiBuffer> buffer_;
++    std::string display_name_;
++    std::chrono::nanoseconds delay {};
++  };
++
+   std::shared_ptr<display_t> kms_display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
++    // VIRTUAL- prefix means this is an EVDI virtual display. Route to the
++    // EVDI-specific capture path that does NOT touch gbm/EGL on the EVDI
++    // card (which would SIGSEGV mesa).
++    if (display_name.rfind("VIRTUAL-", 0) == 0) {
++      auto disp = std::make_shared<display_evdi_t>(hwdevice_type);
++      if (disp->init(display_name, config) == 0) {
++        return disp;
++      }
++      BOOST_LOG(warning) << "[KMS/EVDI] display_evdi_t init failed; falling back to physical capture";
++      // Fall through to the physical-display path below so streaming still
++      // works (mirror mode), albeit not from the virtual display.
++    }
++
+     if (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda) {
+       auto disp = std::make_shared<kms::display_vram_t>(hwdevice_type);
+ 
+@@ -1618,6 +1773,19 @@
+         continue;
+       }
+ 
++      // Skip EVDI cards during the startup probe. They have no render node
++      // and crash mesa's gbm_create_device inside libgallium. EVDI virtual
++      // displays are streamed via the display_evdi_t backend (no GBM),
++      // routed by display name, not by enumerating /dev/dri here.
++      {
++        std::error_code ec;
++        auto drv = fs::read_symlink(fs::path {"/sys/class/drm"} / filestring / "device" / "driver", ec);
++        if (!ec && drv.filename() == "evdi") {
++          BOOST_LOG(debug) << "Skipping EVDI card during startup probe: "sv << filestring;
++          continue;
++        }
++      }
++
+       kms::card_t card;
+       if (card.init(entry.path().c_str())) {
+         continue;

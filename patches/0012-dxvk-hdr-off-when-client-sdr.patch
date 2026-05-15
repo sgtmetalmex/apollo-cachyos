@@ -1,0 +1,66 @@
+Subject: process: inject DXVK_HDR=0 / PROTON_ENABLE_HDR=0 when client is SDR
+
+Diagnosis (from a focused investigation, see notes in patch body):
+
+On KDE Plasma 6 / Wayland + Mesa 26.1 RADV, kwin advertises HDR Wayland
+protocols (wp_color_manager_v1, frog_color_management_factory_v1)
+GLOBALLY — not per-output. Mesa's Vulkan WSI honours them and reports
+VK_COLOR_SPACE_HDR10_ST2084_EXT in vkGetPhysicalDeviceSurfaceFormatsKHR.
+DXVK reads that list and exposes HDR availability to D3D11/12 games.
+
+Apollo's per-output SDR signalling (EVDI EDID without CEA HDR extension,
+display_evdi_t::is_hdr returning false, VDISPLAY::getDisplayHDRByName
+returning false) is invisible to that path. So a game like Ghost of
+Tsushima, running through Proton/DXVK, sees HDR available, enables its
+HDR rendering path, tonemaps back to SDR poorly, and looks "too dark"
+when the user disables HDR in-game.
+
+Apollo can't change kwin's global advertisement, but it CAN tell the
+spawned game itself to disable HDR via the documented DXVK / Proton env
+vars. process.cpp already builds an `_env` map that feeds the child
+process. We add two lines: when `launch_session->enable_hdr` is false
+(client requested SDR), set `DXVK_HDR=0` and `PROTON_ENABLE_HDR=0`
+unless the user already set them via apps.json's env block.
+
+Result: a Steam Deck (no HDR panel) streaming an SDR session gets a
+fully-SDR game pipeline, end to end. Apollo's encoder already emits
+SDR pixels — this patch just makes the game itself not render in HDR
+in the first place.
+
+Note: this does NOT fix games with broken native SDR gamma curves
+(Tsushima is documented to be broken even on Windows/PS5 SDR). For
+those, the user needs in-game brightness adjustment or a Nexus
+brightness-fix mod. But this patch removes one independent cause of
+"dark stream" reports.
+
+--- a/src/process.cpp
++++ b/src/process.cpp
+@@ -415,6 +415,28 @@
+     _env["APOLLO_CLIENT_SCALE_FACTOR"] = std::to_string(scale_factor);
+     _env["APOLLO_CLIENT_FPS"] = fps_str;
+     _env["APOLLO_CLIENT_HDR"] = launch_session->enable_hdr ? "true" : "false";
++
++    // When the client requested SDR, hint the Linux Vulkan / DXVK / Proton
++    // stack to disable HDR output. Without this, kwin_wayland's global
++    // wp_color_manager_v1 advertises HDR colorspaces; mesa RADV's WSI
++    // honours them and DXVK reports VK_COLOR_SPACE_HDR10_ST2084_EXT as
++    // available; games (e.g. Ghost of Tsushima) then enable their HDR
++    // rendering path and the resulting tonemap-back-to-SDR over the
++    // moonlight wire looks wrong (too dark / washed out). Apollo's encoder
++    // is already in SDR mode here (see video_colorspace.cpp), so forcing
++    // the game itself into SDR keeps the whole pipeline consistent.
++    //
++    // Only set when not already set by the user (per-app or global env in
++    // apps.json) — an explicit user override always wins.
++    if (!launch_session->enable_hdr) {
++      if (_env.find("DXVK_HDR") == _env.end()) {
++        _env["DXVK_HDR"] = "0";
++      }
++      if (_env.find("PROTON_ENABLE_HDR") == _env.end()) {
++        _env["PROTON_ENABLE_HDR"] = "0";
++      }
++    }
++
+     _env["APOLLO_CLIENT_GCMAP"] = std::to_string(launch_session->gcmap);
+     _env["APOLLO_CLIENT_HOST_AUDIO"] = launch_session->host_audio ? "true" : "false";
+     _env["APOLLO_CLIENT_ENABLE_SOPS"] = launch_session->enable_sops ? "true" : "false";

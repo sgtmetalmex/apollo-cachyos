@@ -1,0 +1,138 @@
+Subject: kmsgrab: fall back to crtc geometry when card isn't in card_descriptors
+
+Apollo builds its `card_descriptors` list once, inside `kms_display_names()`,
+called during startup probing. The list maps each `/dev/dri/cardN` path to
+its monitors (CRTC → viewport). It's a static `std::vector<card_descriptor_t>`
+and never refreshed.
+
+When a virtual EVDI display is created mid-session (by the patched
+VDISPLAY::createVirtualDisplay flow), the new `/dev/dri/card0` does not
+exist in `card_descriptors`. So when KMS screencast init scans `/dev/dri`,
+finds a plane with `fb_id` on the new EVDI card, and tries to look the
+card up:
+
+    auto pos = std::find_if(begin(card_descriptors), end(card_descriptors),
+                            [&](card_descriptor_t &cd) { return cd.path == filestring; });
+    if (pos == end(card_descriptors)) {
+      BOOST_LOG(error) << "Couldn't find [" << entry.path()
+                       << "]: This shouldn't have happened :/";
+      return -1;
+    }
+
+…it bails with `-1`, every encoder probe fails, and the Steam Deck client
+gets a `503 Failed to initialize video/capture encoding`.
+
+The actual fatal log from a real session:
+
+    Found monitor for DRM screencasting
+    Error: Couldn't find ["/dev/dri/card0"]: This shouldn't have happened :/
+    [repeats for nvenc → vaapi → software]
+    Fatal: Unable to find display or encoder during startup.
+
+But card_descriptors is only used to look up a viewport for the matched
+crtc — and the code already has a "crtc not in crtc_to_monitor" fallback
+that uses `crtc->width/height/x/y` directly. Just route the "card not in
+descriptors" case to that same fallback. For an EVDI card, the crtc
+geometry equals the EDID we just programmed (1280x800 for Steam Deck),
+which is exactly what we want to capture.
+
+End-to-end after this patch:
+
+    Found monitor for DRM screencasting
+    Card [/dev/dri/card0] not in card_descriptors (hotplugged after startup, e.g. EVDI); using crtc geometry
+    Found connector ID [40]
+    Creating encoder [hevc_vaapi]
+    Color coding: SDR (Rec. 601)
+    ...
+
+--- a/src/platform/linux/kmsgrab.cpp
++++ b/src/platform/linux/kmsgrab.cpp
+@@ -675,11 +675,17 @@
+               return cd.path == filestring;
+             });
+ 
+-            if (pos == std::end(card_descriptors)) {
+-              // This code path shouldn't happen, but it's there just in case.
+-              // card_descriptors is part of the guesswork after all.
+-              BOOST_LOG(error) << "Couldn't find ["sv << entry.path() << "]: This shouldn't have happened :/"sv;
+-              return -1;
++            // NOTE: card_descriptors is built ONCE by kms_display_names() at
++            // startup. If the user creates a virtual EVDI display after that,
++            // its card path won't be in the list. The original code returned
++            // -1 here (the "Couldn't find ... shouldn't have happened" error),
++            // which made every encoder fail for fresh EVDI cards. We instead
++            // fall through to the same crtc-based fallback used when the
++            // viewport map lookup misses below.
++            const bool have_descriptor = (pos != std::end(card_descriptors));
++            if (!have_descriptor) {
++              BOOST_LOG(info) << "Card ["sv << entry.path()
++                              << "] not in card_descriptors (hotplugged after startup, e.g. EVDI); using crtc geometry"sv;
+             }
+ 
+             // TODO: surf_sd = fb->to_sd();
+@@ -694,33 +700,41 @@
+             this->env_width = ::platf::kms::env_width;
+             this->env_height = ::platf::kms::env_height;
+ 
+-            auto monitor = pos->crtc_to_monitor.find(plane->crtc_id);
+-            if (monitor != std::end(pos->crtc_to_monitor)) {
+-              auto &viewport = monitor->second.viewport;
+-
+-              width = viewport.width;
+-              height = viewport.height;
+-
+-              switch (card.get_panel_orientation(plane->plane_id)) {
+-                case DRM_MODE_ROTATE_270:
+-                  BOOST_LOG(debug) << "Detected panel orientation at 90, swapping width and height.";
+-                  width = viewport.height;
+-                  height = viewport.width;
+-                  break;
+-                case DRM_MODE_ROTATE_90:
+-                case DRM_MODE_ROTATE_180:
+-                  BOOST_LOG(warning) << "Panel orientation is unsupported, screen capture may not work correctly.";
+-                  break;
++            bool viewport_resolved = false;
++            if (have_descriptor) {
++              auto monitor = pos->crtc_to_monitor.find(plane->crtc_id);
++              if (monitor != std::end(pos->crtc_to_monitor)) {
++                auto &viewport = monitor->second.viewport;
++
++                width = viewport.width;
++                height = viewport.height;
++
++                switch (card.get_panel_orientation(plane->plane_id)) {
++                  case DRM_MODE_ROTATE_270:
++                    BOOST_LOG(debug) << "Detected panel orientation at 90, swapping width and height.";
++                    width = viewport.height;
++                    height = viewport.width;
++                    break;
++                  case DRM_MODE_ROTATE_90:
++                  case DRM_MODE_ROTATE_180:
++                    BOOST_LOG(warning) << "Panel orientation is unsupported, screen capture may not work correctly.";
++                    break;
++                }
++
++                offset_x = viewport.offset_x;
++                offset_y = viewport.offset_y;
++                viewport_resolved = true;
+               }
+-
+-              offset_x = viewport.offset_x;
+-              offset_y = viewport.offset_y;
+             }
+ 
+-            // This code path shouldn't happen, but it's there just in case.
+-            // crtc_to_monitor is part of the guesswork after all.
+-            else {
+-              BOOST_LOG(warning) << "Couldn't find crtc_id, this shouldn't have happened :\\"sv;
++            if (!viewport_resolved) {
++              // Fallback: use crtc geometry directly. Covers both "card not
++              // in card_descriptors" (hotplugged EVDI) and "crtc not in
++              // crtc_to_monitor" (the original "shouldn't have happened"
++              // case).
++              if (have_descriptor) {
++                BOOST_LOG(warning) << "Couldn't find crtc_id in crtc_to_monitor, using crtc geometry"sv;
++              }
+               width = crtc->width;
+               height = crtc->height;
+               offset_x = crtc->x;

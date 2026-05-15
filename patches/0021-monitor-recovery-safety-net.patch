@@ -1,0 +1,224 @@
+Subject: monitor-recovery safety net: never leave the physical monitor disabled
+
+User reported their physical monitor stayed dark after an apollo session
+even though the in-process `[VDISPLAY] Restored kscreen primary to: DP-3`
+log line ran. They had to SSH in and re-enable the output via CLI.
+That is a hard "must never happen again" rule.
+
+The existing flow relies on apollo's `on_evdi_removed()` running before
+the process exits. But three classes of failure skip that:
+
+  * SIGSEGV / SIGABRT inside the encoder, capture loop, or kscreen
+    JSON parse, before the cleanup branch runs.
+  * SIGKILL from the OOM killer (apollo peaked at 9G RSS in the
+    journal — the kernel WILL kill it under memory pressure and
+    SIGKILL cannot be caught).
+  * Hard power-off or kernel panic.
+
+In every case the on-disk kwin state shows the physical primary
+disabled and the user has no working desktop.
+
+This patch adds a small, crash-safe state file:
+
+  $XDG_STATE_HOME/apollo/saved-primary  (typically ~/.local/state/apollo/saved-primary)
+
+written atomically the moment apollo disables a physical output, and
+deleted on clean restore. Two independent recovery paths consult it:
+
+  1. apollo's openVDisplayDevice() calls a new kscreen::recover_on_startup()
+     before doing ANYTHING else. If a previous session left the file
+     behind, we run `kscreen-doctor output.<name>.enable
+     output.<name>.priority.1` and delete the file. Triggers when the
+     user restarts apollo after a crash, OR on the next boot's auto-start.
+
+  2. The systemd user unit now has `ExecStopPost=-/usr/bin/apollo-monitor-recovery`.
+     systemd runs ExecStopPost after the main process exits even if it
+     was killed by SIGKILL. The script reads the same state file and
+     runs the same kscreen-doctor command. Triggers immediately when
+     apollo dies for any reason, before the user notices.
+
+The two paths overlap intentionally — belt and suspenders. If one
+fails (e.g. kscreen-doctor not yet available in the systemd execution
+environment) the other still catches it.
+
+Pure addition: no change to the normal-shutdown code path, no change
+to the EVDI capture / encoder / fps behaviour.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -298,7 +298,89 @@
+     static std::mutex state_mutex;
+     static int evdi_active_count = 0;
+     static std::string saved_primary;
+ 
++    // Patch 0021: crash-safe monitor recovery.
++    //
++    // The in-memory `saved_primary` is lost if apollo dies between
++    // wait_and_promote_new_to_primary() and on_evdi_removed() — SIGSEGV,
++    // SIGKILL/OOM, hard power-off, etc. That left the user's physical
++    // monitor disabled with no way to recover except SSH-ing in.
++    //
++    // We now also write `saved_primary` to a small state file the moment
++    // we disable a physical output, and delete it on clean restore. On
++    // every apollo startup we look for a stale state file and, if present,
++    // run the same restore command before doing anything else. Combined
++    // with systemd ExecStopPost (which runs even after SIGKILL), this
++    // guarantees the physical monitor comes back.
++    static std::string state_file_path() {
++      // Prefer $XDG_STATE_HOME, then $HOME/.local/state, then $HOME/.cache.
++      const char *xdg_state = std::getenv("XDG_STATE_HOME");
++      const char *home = std::getenv("HOME");
++      std::string base;
++      if (xdg_state && xdg_state[0]) {
++        base = std::string(xdg_state) + "/apollo";
++      } else if (home && home[0]) {
++        base = std::string(home) + "/.local/state/apollo";
++      } else {
++        return "";  // no usable path
++      }
++      // mkdir -p (best-effort)
++      std::error_code ec;
++      fs::create_directories(base, ec);
++      return base + "/saved-primary";
++    }
++
++    // Write `name` atomically: write to .tmp, rename. Safe to call from
++    // any thread. Returns true on success.
++    static bool write_state_file(const std::string &name) {
++      const std::string path = state_file_path();
++      if (path.empty()) {
++        return false;
++      }
++      const std::string tmp = path + ".tmp";
++      {
++        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
++        if (!f) {
++          return false;
++        }
++        f << name;
++      }
++      std::error_code ec;
++      fs::rename(tmp, path, ec);
++      if (ec) {
++        fs::remove(tmp, ec);
++        return false;
++      }
++      return true;
++    }
++
++    static std::string read_state_file() {
++      const std::string path = state_file_path();
++      if (path.empty()) {
++        return "";
++      }
++      std::ifstream f(path);
++      if (!f) {
++        return "";
++      }
++      std::string out;
++      std::getline(f, out);
++      // strip trailing whitespace / newlines defensively
++      while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
++        out.pop_back();
++      }
++      return out;
++    }
++
++    static void delete_state_file() {
++      const std::string path = state_file_path();
++      if (path.empty()) {
++        return;
++      }
++      std::error_code ec;
++      fs::remove(path, ec);
++    }
++
+     static std::string run_capture(const std::string &cmd) {
+       std::array<char, 4096> buf {};
+       std::string out;
+@@ -468,6 +551,19 @@
+           saved_primary.clear();
+         } else {
+           saved_primary = original_primary;
++          // Patch 0021: persist saved_primary to disk BEFORE we disable the
++          // physical output. If apollo dies before on_evdi_removed runs
++          // (SIGSEGV, SIGKILL/OOM, hard reset, etc.), the next apollo
++          // startup or the systemd ExecStopPost script will read this file
++          // and re-enable the physical monitor. Failure is non-fatal — we
++          // just lose the safety net for this session.
++          if (!write_state_file(saved_primary)) {
++            BOOST_LOG(warning) << "[VDISPLAY/kscreen] could not write recovery state file at "
++                               << state_file_path() << " — physical monitor will NOT auto-recover if apollo crashes";
++          } else {
++            BOOST_LOG(info) << "[VDISPLAY/kscreen] wrote recovery state file: "
++                            << state_file_path() << " (saved_primary=" << saved_primary << ")";
++          }
+         }
+       }
+       ++evdi_active_count;
+@@ -511,9 +606,36 @@
+           BOOST_LOG(info) << "[VDISPLAY] Restored kscreen primary to: " << saved_primary << " (re-enabled and promoted)";
+         }
+         saved_primary.clear();
++        // Patch 0021: clean restore done — remove the recovery state file
++        // so the next apollo startup doesn't try to "recover" something
++        // that's already in the user's desired state.
++        delete_state_file();
+       }
+     }
+ 
++    // Patch 0021: called from openVDisplayDevice() on apollo startup. If a
++    // previous apollo session crashed (SIGSEGV, SIGKILL/OOM, power loss)
++    // between disabling the physical primary and restoring it, the state
++    // file persists. Read it, re-enable + promote, and clear the file.
++    // No-op when there's no stale state.
++    void recover_on_startup() {
++      const std::string prev = read_state_file();
++      if (prev.empty()) {
++        return;
++      }
++      if (!is_safe_name(prev)) {
++        BOOST_LOG(warning) << "[VDISPLAY/kscreen] state file contained unsafe name; refusing to use: "
++                           << prev;
++        delete_state_file();
++        return;
++      }
++      BOOST_LOG(info) << "[VDISPLAY/kscreen] previous apollo session did not clean up "
++                      << "(state file present); restoring " << prev << " as primary";
++      const std::string cmd = "kscreen-doctor output." + prev + ".enable output." + prev + ".priority.1";
++      run_status(cmd);
++      delete_state_file();
++    }
++
+   }  // namespace kscreen
+ 
+   // ============================================================================
+@@ -1060,6 +1141,14 @@
+ 
+     BOOST_LOG(info) << "[VDISPLAY] Initializing Linux virtual display driver...";
+ 
++    // Patch 0021: monitor-recovery safety net. If the previous apollo
++    // session was killed (SIGSEGV, SIGKILL/OOM, hard power-off) between
++    // disabling the physical primary and restoring it, the user is left
++    // staring at a dark physical monitor with no easy fix. recover_on_startup
++    // reads the persisted "saved_primary" state file and runs kscreen-doctor
++    // to re-enable it. No-op when the previous session shut down cleanly.
++    kscreen::recover_on_startup();
++
+     // Wipe stale EVDI cards from any prior crashed run BEFORE Apollo's
+     // encoder probe scans /dev/dri/* — otherwise mesa gbm_create_device
+     // SIGSEGVs on the orphaned card.
+--- a/packaging/linux/sunshine.service.in
++++ b/packaging/linux/sunshine.service.in
+@@ -8,6 +8,11 @@
+ ExecStartPre=/bin/sleep 5
+ @SUNSHINE_SERVICE_START_COMMAND@
+ @SUNSHINE_SERVICE_STOP_COMMAND@
++# Patch 0021: ALWAYS run the monitor-recovery script after apollo exits,
++# even after SIGKILL/OOM. The "-" prefix tells systemd to ignore the exit
++# code so a clean shutdown (where there's nothing to restore) doesn't
++# leave the unit in a "failed" state.
++ExecStopPost=-/usr/bin/apollo-monitor-recovery
+ Restart=on-failure
+ RestartSec=5s
+ 

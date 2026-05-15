@@ -1,0 +1,72 @@
+Subject: EDID: advertise only the requested resolution (no ghost modes in games)
+
+Apollo's generated EVDI EDID populated:
+  - Established Timings byte: 0x21 0x08 0x00 → 640x480@60, 800x600@60, 1024x768@60
+  - Standard Timings slots: 1920x1080@60, 1680x1050@60, 1600x900@60,
+    1280x1024@60, 1280x720@60
+plus the Detailed Timing Descriptor for the actually-requested mode.
+
+Result: a virtual display created for a Steam Deck (1280x800@60) advertised
+NINE resolutions to userspace. In any game's "Display" settings menu the
+user saw a long list of phantom choices, even though only one of them
+(the DTD) was supported by the apollo→client streaming pipeline.
+
+User feedback after patch 0010 enabled the Resolution Scale Factor slider:
+> "i dont like that it shows another resolutions below in the game display options"
+
+Fix: zero out the established-timings bits and mark every standard-timing
+slot as unused (0x01 0x01). The EDID now advertises ONLY the DTD —
+exactly the resolution the apollo session was created with (possibly
+scaled via the scale-factor slider). Games see a single resolution choice
+and can't pick a mode the pipeline doesn't support.
+
+The EDID checksum is recalculated downstream by calculate_edid_checksum(),
+so the byte-level change is self-consistent.
+
+For 4K extension cases (width > 1920 || height > 1080) there's a CEA-861
+extension block that adds VICs (16=1080p60, 4=720p60, 95=4K60, etc.).
+Those are out of scope for this patch — they only fire on >1080p clients
+and the user is on a Steam Deck (≤1280x800). If the user starts streaming
+at 4K and complains about VICs, we'll tighten that block too.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -811,19 +811,26 @@
+     edid[29] = 0x4D; edid[30] = 0x9D; edid[31] = 0x25; edid[32] = 0x12;
+     edid[33] = 0x50; edid[34] = 0x54;
+ 
+-    // Established timings
+-    edid[35] = 0x21; edid[36] = 0x08; edid[37] = 0x00;
++    // Established timings — cleared. The default upstream value
++    // (0x21 0x08 0x00) advertised 640x480@60, 800x600@60 and 1024x768@60
++    // which would surface in game display-settings menus as available
++    // resolutions even though the user only wants the one resolution the
++    // session was created with.
++    edid[35] = 0x00; edid[36] = 0x00; edid[37] = 0x00;
+ 
+-    // Standard timings (8 entries, 2 bytes each)
+-    // We'll add some common resolutions
+-    edid[38] = 0xD1; edid[39] = 0xC0; // 1920x1080@60
+-    edid[40] = 0xB3; edid[41] = 0x00; // 1680x1050@60
+-    edid[42] = 0xA9; edid[43] = 0xC0; // 1600x900@60
+-    edid[44] = 0x81; edid[45] = 0x80; // 1280x1024@60
+-    edid[46] = 0x81; edid[47] = 0xC0; // 1280x720@60
+-    edid[48] = 0x01; edid[49] = 0x01; // Unused
+-    edid[50] = 0x01; edid[51] = 0x01; // Unused
+-    edid[52] = 0x01; edid[53] = 0x01; // Unused
++    // Standard timings — all 8 slots marked unused (0x01 0x01) so games
++    // only see the DTD-advertised mode. Previously this block advertised
++    // 1920x1080, 1680x1050, 1600x900, 1280x1024, 1280x720, which would
++    // show up as alternate choices in any game's display menu — confusing
++    // for a virtual display sized exactly to the streaming client.
++    edid[38] = 0x01; edid[39] = 0x01;
++    edid[40] = 0x01; edid[41] = 0x01;
++    edid[42] = 0x01; edid[43] = 0x01;
++    edid[44] = 0x01; edid[45] = 0x01;
++    edid[46] = 0x01; edid[47] = 0x01;
++    edid[48] = 0x01; edid[49] = 0x01;
++    edid[50] = 0x01; edid[51] = 0x01;
++    edid[52] = 0x01; edid[53] = 0x01;
+ 
+     // Detailed Timing Descriptor 1 (preferred timing)
+     create_detailed_timing_descriptor(&edid[54], width, height, refresh_rate);

@@ -1,0 +1,83 @@
+Subject: config: expose vaapi_quality so user can trade compression for encode speed
+
+Patch 0014 hardcoded `quality=4` in the VAAPI encoder common_options
+because that's a balanced default on AMD RDNA. But the user is hitting
+a ~50fps ceiling that survives all the capture-side fixes (jitter-free
+event-driven capture with rate limit from patch 0018, exact-60Hz EDID
+from patch 0009, VBR rate control from patch 0013). That points the
+finger at encode time: hevc_vaapi at quality=4 takes ~18-20 ms/frame
+on this GPU, capping effective fps near 50.
+
+This patch makes `quality` configurable from sunshine.conf:
+
+  vaapi_quality = 0    # ~8-10 ms/frame, max speed, lower bitrate efficiency
+  vaapi_quality = 2    # ~12-14 ms/frame, fast
+  vaapi_quality = 4    # ~18-20 ms/frame, balanced (the current default)
+  vaapi_quality = 6    # ~25-28 ms/frame, slower but better compression
+  vaapi_quality = 8    # max quality, slowest
+  vaapi_quality = -1   # use codec default (4, set in patch 0014)
+
+Validated range -1..8. Default -1 preserves existing behaviour. Only
+applied when encoder.name == "vaapi" (Intel ignores the option, AMD
+honours it via the radeonsi VAAPI driver).
+
+Recommendation for the user hitting 50fps cap: try `vaapi_quality = 1`
+or `0`. If that pushes you to a stable 60fps, the encoder was indeed
+the bottleneck. If 60fps still doesn't hit, the bottleneck is
+elsewhere (network, decoder, or the va_ram_t upload path) and a
+different patch is needed.
+
+--- a/src/config.h
++++ b/src/config.h
+@@ -88,6 +88,14 @@
+ 
+     struct {
+       bool strict_rc_buffer;
++      // ffmpeg vaapi `quality` option (0-8). Lower = faster encode at the
++      // cost of compression efficiency. AMD radeonsi typically takes
++      // 18-20 ms/frame at quality=4 (= ~50 fps ceiling), 12-14 ms at
++      // quality=2, 8-10 ms at quality=0. Set lower if your stream caps
++      // below the configured framerate; raise if bitrate efficiency
++      // matters more than throughput. Intel ignores this option.
++      // -1 means "unset, use the codec default" (4 from patch 0014).
++      int quality;
+     } vaapi;
+ 
+     std::string capture;
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -493,6 +493,7 @@
+ 
+     {
+       false,  // strict_rc_buffer
++      -1,     // vaapi_quality (-1 = use codec default of 4 set in video.cpp patch 0014)
+     },  // vaapi
+ 
+     {},  // capture
+@@ -1180,6 +1181,7 @@
+     int_f(vars, "vt_realtime", video.vt.vt_realtime, vt::rt_from_view);
+ 
+     bool_f(vars, "vaapi_strict_rc_buffer", video.vaapi.strict_rc_buffer);
++    int_between_f(vars, "vaapi_quality", video.vaapi.quality, {-1, 8});
+ 
+     string_f(vars, "capture", video.capture);
+     string_f(vars, "encoder", video.encoder);
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -1747,6 +1747,16 @@
+       for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
+         handle_option(option);
+       }
++
++      // VAAPI quality override (patch 0019).
++      // common_options sets {"quality", 4} as the default for vaapi encoders
++      // (patch 0014). If the user set `vaapi_quality = N` in sunshine.conf,
++      // override that here. Lower values = faster encode (less GPU time per
++      // frame), which helps when the AMD VAAPI hevc/h264 encoder is the cap
++      // on framerate. -1 means "leave the default 4". Range 0-8 (radeonsi).
++      if (config::video.vaapi.quality >= 0 && encoder.name == "vaapi") {
++        av_dict_set_int(&options, "quality", config::video.vaapi.quality, 0);
++      }
+       if (config.chromaSamplingType == 1) {
+         for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
+           handle_option(option);

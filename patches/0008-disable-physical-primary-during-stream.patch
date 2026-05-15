@@ -1,0 +1,70 @@
+Subject: Disable (not just demote) the physical primary during EVDI streaming
+
+Patch 0002 made the EVDI virtual display kscreen's priority-1 output, and
+demoted the prior physical primary (e.g. DP-3) to priority 2. That was
+enough to route new windows to the EVDI display IF kwin's per-output-combo
+state in ~/.config/kwinoutputconfig.json agreed.
+
+But ~/.config/kwinoutputconfig.json holds saved setups keyed by the set of
+connected outputs. When EVDI hotplugs, kwin first applies whichever saved
+setup matches the new combo — which on this user's box was a stale
+dual-GPU-era entry that re-promoted DP-3 to primary. Our patch 0002 then
+overwrites it, but Steam / game launchers had already cached "primary
+output = DP-3" and continued spawning windows there. Invisible to the
+Steam Deck stream.
+
+Surgically removing the stale setup helps, but it's not durable — kwin
+saves new setups whenever the output topology changes, so a future stale
+entry could resurrect the problem.
+
+Belt + braces fix: DISABLE the physical primary during the stream entirely.
+The desktop becomes "EVDI display only" for the duration of the session.
+Steam, games, every window manager heuristic has no other surface to land
+on. When the stream ends, on_evdi_removed re-enables AND re-promotes the
+saved original primary back, restoring the user's normal desktop.
+
+The disable + enable both go through a single kscreen-doctor invocation
+(with `output.<x>.enable output.<x>.priority.1` chained) so the atomic
+apply avoids any frame where the user has no primary at all.
+
+Affects only Apollo streaming sessions (createVirtualDisplay -> remove).
+Other workflows (gamescope, normal desktop usage) are untouched.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -466,9 +466,18 @@
+                       << " (saved old primary: "
+                       << (saved_primary.empty() ? "<none>" : saved_primary) << ")";
+ 
++      // Also DISABLE the physical primary during the stream. Without this,
++      // kwin remembers per-output-combo configs in ~/.config/kwinoutputconfig.json
++      // and may re-mark the physical monitor as primary at session start,
++      // before our priority-promote runs. Steam and game launchers then
++      // spawn windows on the physical display instead of the EVDI virtual
++      // one — invisible to the Steam Deck stream. Disabling the physical
++      // output entirely forces windows onto the EVDI display. The disable
++      // is reversed in on_evdi_removed() so the user's normal desktop
++      // returns when the stream ends.
+       std::string cmd = "kscreen-doctor output." + new_name + ".enable output." + new_name + ".priority.1";
+       if (!saved_primary.empty() && is_safe_name(saved_primary)) {
+-        cmd += " output." + saved_primary + ".priority.2";
++        cmd += " output." + saved_primary + ".disable";
+       }
+       const int rc = run_status(cmd);
+       if (rc != 0) {
+@@ -483,9 +492,13 @@
+       }
+       if (evdi_active_count == 0 && !saved_primary.empty()) {
+         if (is_safe_name(saved_primary)) {
+-          const std::string cmd = "kscreen-doctor output." + saved_primary + ".priority.1";
++          // Re-enable AND promote the original primary back. Order matters
++          // here: kscreen-doctor applies the commands as one atomic update,
++          // so enable + priority.1 in the same call avoids a flicker where
++          // the user has no primary output for a brief moment.
++          const std::string cmd = "kscreen-doctor output." + saved_primary + ".enable output." + saved_primary + ".priority.1";
+           run_status(cmd);
+-          BOOST_LOG(info) << "[VDISPLAY] Restored kscreen primary to: " << saved_primary;
++          BOOST_LOG(info) << "[VDISPLAY] Restored kscreen primary to: " << saved_primary << " (re-enabled and promoted)";
+         }
+         saved_primary.clear();
+       }

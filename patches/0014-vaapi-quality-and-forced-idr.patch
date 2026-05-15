@@ -1,0 +1,64 @@
+Subject: video: add quality=4 and forced_idr=1 to VAAPI encoder common options
+
+Two encoder-side knobs Apollo wasn't setting, both relevant to Wi-Fi
+streaming smoothness and packet-loss recovery:
+
+1. `forced_idr=1` — when moonlight requests a mid-stream IDR frame
+   (used for fast packet-loss recovery on Wi-Fi), ffmpeg's vaapi
+   encoder may silently merge the IDR request into the next P-frame
+   instead of emitting a real keyframe. With `forced_idr=1`, the IDR
+   request always produces an actual IDR — moonlight's recovery path
+   works as intended. Without it, after a packet loss the client may
+   stay in a "waiting for keyframe" state for an extra GOP-length,
+   which the user perceives as a stutter/freeze.
+
+2. `quality=4` — AMD radeonsi VAAPI exposes a 0-8 quality preset
+   (0 = speed-priority, 8 = quality-priority). 4 is a balanced
+   low-latency point for RDNA encoders. Intel ignores this option.
+   Without setting it, ffmpeg passes through whatever the underlying
+   VA driver defaults to, which on RDNA3/4 is typically the
+   quality-priority extreme — slower encode, more host CPU.
+
+Both options are added to the "Common options" block for all three
+VAAPI encoder profiles (av1_vaapi, hevc_vaapi, h264_vaapi). They are
+inert on hardware that doesn't recognise them.
+
+Combined with patch 0013 (VBR rate control on AMD), the user should
+see noticeably smoother streaming and faster recovery from any Wi-Fi
+hiccups.
+
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -925,6 +925,14 @@
+       {
+         {"async_depth"s, 1},
+         {"idr_interval"s, std::numeric_limits<int>::max()},
++        // forced_idr=1 so moonlight's mid-stream IDR requests
++        // (for packet-loss recovery on Wi-Fi) are honoured as real
++        // IDR frames instead of being merged into P frames.
++        {"forced_idr"s, 1},
++        // quality knob on AMD radeonsi VAAPI: lower = faster encode,
++        // higher = better quality. 4 is a balanced low-latency point
++        // for AMD RDNA encoders (Intel ignores this option).
++        {"quality"s, 4},
+       },
+       {},  // SDR-specific options
+       {},  // HDR-specific options
+@@ -939,6 +947,8 @@
+         {"async_depth"s, 1},
+         {"sei"s, 0},
+         {"idr_interval"s, std::numeric_limits<int>::max()},
++        {"forced_idr"s, 1},
++        {"quality"s, 4},
+       },
+       {},  // SDR-specific options
+       {},  // HDR-specific options
+@@ -953,6 +963,8 @@
+         {"async_depth"s, 1},
+         {"sei"s, 0},
+         {"idr_interval"s, std::numeric_limits<int>::max()},
++        {"forced_idr"s, 1},
++        {"quality"s, 4},
+       },
+       {},  // SDR-specific options
+       {},  // HDR-specific options

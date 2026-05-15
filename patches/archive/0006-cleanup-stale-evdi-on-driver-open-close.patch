@@ -1,0 +1,113 @@
+Subject: Wipe stale EVDI /dev/dri/cardN entries on driver open & close
+
+libevdi's evdi_disconnect() only flips the connector state to disconnected;
+it does NOT remove /dev/dri/cardN. The card stays around until something
+writes "1" to /sys/devices/evdi/remove_all (or the kernel module is
+unloaded).
+
+Combined with patch 0004 (kmsgrab now accepts EVDI cards in its fallback
+path), this means: if Apollo is restarted while an EVDI card from a prior
+session is still in /dev/dri/, the new Apollo's encoder-probe sequence at
+startup hits that stale card and tries to gbm_create_device() on it. Mesa
+SIGSEGVs inside libgallium during DRI screen init because EVDI has no
+render node and isn't a real GPU. Apollo crashes during start-pre, the
+Steam Deck client gets "Connection Refused".
+
+Repro before this patch:
+
+  1. apollo running, Steam Deck streams (creates EVDI card0).
+  2. Steam Deck disconnects → removeVirtualDisplay calls evdi.disconnect +
+     evdi.close. /dev/dri/card0 (EVDI) survives.
+  3. `systemctl --user restart apollo` (or any apollo restart).
+  4. New apollo, encoder probe, mesa SIGSEGV in gbm_create_device on card0.
+  5. `apollo.service: Failed with result 'core-dump'`. Service flaps.
+
+Fix: write "1" to /sys/devices/evdi/remove_all at both ends of the VDISPLAY
+driver lifecycle:
+
+  - openVDisplayDevice(): cleans up any leftover from a crashed prior run
+    BEFORE Apollo's kmsgrab probes /dev/dri/*.
+  - closeVDisplayDevice(): cleans up our own cards on normal shutdown so we
+    leave a clean tree for the next startup.
+
+Also unregister the per-display libevdi buffer (registered by patch 0005)
+inside closeVDisplayDevice's loop, so the kernel doesn't keep a reference
+to memory we're about to free.
+
+The remove_all sysfs file is mode 0220 group=video thanks to evdi-perms.service
+shipped with this package, so apollo (uid in video group) can write to it
+without needing CAP_DAC_OVERRIDE.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -928,6 +928,32 @@
+     }
+   }
+ 
++  // Clear any leftover EVDI /dev/dri/cardN entries from a previous Apollo
++  // run that didn't clean up (crash, hard restart, etc.). evdi_disconnect()
++  // alone leaves the cardN file in place; only writing "1" to
++  // /sys/devices/evdi/remove_all actually removes it. Without this, mesa's
++  // libgbm crashes inside gbm_create_device when Apollo's kmsgrab probes
++  // /dev/dri/* at startup with a stale EVDI card still present.
++  //
++  // Safe even if no EVDI devices exist (count=0 just returns ENODEV-like
++  // success). Best-effort: ignore write errors so this never blocks startup.
++  static void cleanup_stale_evdi_devices() {
++    const char *path = "/sys/devices/evdi/remove_all";
++    int fd = ::open(path, O_WRONLY | O_CLOEXEC);
++    if (fd < 0) {
++      BOOST_LOG(debug) << "[VDISPLAY] Couldn't open " << path << " for cleanup: " << strerror(errno);
++      return;
++    }
++    const char one = '1';
++    ssize_t n = ::write(fd, &one, 1);
++    if (n < 0) {
++      BOOST_LOG(debug) << "[VDISPLAY] write to " << path << " failed: " << strerror(errno);
++    } else {
++      BOOST_LOG(info) << "[VDISPLAY] Cleared any stale EVDI /dev/dri/cardN entries.";
++    }
++    ::close(fd);
++  }
++
+   DRIVER_STATUS openVDisplayDevice() {
+     std::lock_guard<std::mutex> lock(vdisplay_mutex);
+ 
+@@ -937,6 +963,13 @@
+ 
+     BOOST_LOG(info) << "[VDISPLAY] Initializing Linux virtual display driver...";
+ 
++    // Before we let Apollo's kmsgrab probe /dev/dri/* (which happens during
++    // encoder testing right after this returns), wipe any leftover EVDI
++    // cards. Without this, mesa libgbm SIGSEGVs on a stale EVDI card and
++    // Apollo never reaches the "listening" state, so Steam Deck clients see
++    // "Connection Refused".
++    cleanup_stale_evdi_devices();
++
+     // Try to load EVDI library
+     evdi_available = load_evdi_library();
+ 
+@@ -994,6 +1027,10 @@
+     for (auto &[guid, vdinfo] : virtual_displays) {
+       if (vdinfo.active) {
+         if (vdinfo.using_evdi && vdinfo.handle) {
++          if (vdinfo.evdi_buf_id > 0) {
++            evdi.unregister_buffer(vdinfo.handle, vdinfo.evdi_buf_id);
++            vdinfo.evdi_buf_id = 0;
++          }
+           evdi.disconnect(vdinfo.handle);
+           evdi.close(vdinfo.handle);
+         }
+@@ -1004,6 +1041,12 @@
+     }
+     virtual_displays.clear();
+ 
++    // Actually remove the EVDI /dev/dri/cardN entries we created, so a
++    // restart of Apollo starts with a clean /dev/dri/. evdi_disconnect only
++    // marks the connector disconnected — the cardN device persists until
++    // we write to /sys/devices/evdi/remove_all.
++    cleanup_stale_evdi_devices();
++
+     // Unload EVDI library
+     unload_evdi_library();
+ 

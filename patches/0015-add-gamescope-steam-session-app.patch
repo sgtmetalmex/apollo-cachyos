@@ -1,0 +1,54 @@
+Subject: apps.json: add "Gamescope Steam Session" default entry
+
+User request: a Steam streaming target that runs through Gamescope so the
+session behaves like SteamOS Gaming Mode — forced fullscreen, FSR
+upscaling, tight refresh-rate handling, immediate-flips presentation.
+
+Gamescope (gamescope 3.16+, already a CachyOS package) is a micro-
+compositor designed for game presentation. Nesting it inside kwin on
+the EVDI virtual display gives us:
+
+  - `-f` fullscreen exclusive (no kwin window decorations / panels)
+  - `-r <fps>` lock-step refresh matching the client target
+  - `--upscale-filter fsr --upscale-sharpness 4` FSR 1.0 upscaling
+    (games can render at lower internal res for perf; gamescope
+    upscales to the EVDI buffer's resolution)
+  - `--immediate-flips` lowest-latency present path
+  - `-e` Steam integration (gamepad input routing, app lifecycle)
+  - When gamescope exits, the wrapping `steam -bigpicture` exits too,
+    cleanly ending the Apollo session
+
+The entry uses Apollo's existing env-var substitution to inherit the
+client's negotiated dimensions:
+   gamescope -W $(APOLLO_CLIENT_WIDTH) -H $(APOLLO_CLIENT_HEIGHT)
+             -r $(APOLLO_CLIENT_FPS) ...
+APOLLO_CLIENT_FPS is already in integer Hz (process.cpp converts from
+the mHz wire value), so no /1000 needed.
+
+`virtual-display: true` triggers EVDI display creation (patches 0001-
+0007); `wait-all: true` keeps Apollo holding the session until
+gamescope exits.
+
+Adds `gamescope` to PKGBUILD optdepends so the package metadata
+documents the requirement without making it a hard dep (other Apollo
+use cases work without it).
+
+--- a/src_assets/linux/assets/apps.json
++++ b/src_assets/linux/assets/apps.json
+@@ -31,6 +31,16 @@
+         "setsid steam steam://open/bigpicture"
+       ],
+       "image-path": "steam.png"
++    },
++    {
++      "name": "Gamescope Steam Session",
++      "image-path": "steam.png",
++      "virtual-display": true,
++      "auto-detach": false,
++      "wait-all": true,
++      "exit-timeout": 5,
++      "scale-factor": 100,
++      "cmd": "gamescope --backend=wayland -W $(APOLLO_CLIENT_WIDTH) -H $(APOLLO_CLIENT_HEIGHT) -r $(APOLLO_CLIENT_FPS) -f -e --upscale-filter fsr --upscale-sharpness 4 --immediate-flips -- steam -bigpicture"
+     }
+   ]
+ }

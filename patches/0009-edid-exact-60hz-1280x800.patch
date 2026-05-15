@@ -1,0 +1,51 @@
+Subject: EDID: add exact 1280x800@60Hz timing for Steam Deck native resolution
+
+Apollo's `create_detailed_timing_descriptor` has hand-tuned timing constants for
+4K, 1440p, 1080p, and 720p — all producing exactly 60.0 Hz. Any other
+resolution falls into a generic CVT fallback whose integer arithmetic
+introduces rounding error.
+
+For 1280x800 (the Steam Deck's native panel) the generic branch produced:
+   pixel_clock_khz ≈ 73,340
+   h_total = 1472, v_total = 845
+   fps = 73,340,000 / (1472 * 845) ≈ 58.96 Hz
+
+So the EDID told kwin the EVDI display ran at 59Hz, and the kernel mode-changed
+event confirmed it ("Notifying mode changed: 1280x800@59"). kwin pageflipped at
+59Hz, the Steam Deck targeted 60, and the rate mismatch + jitter dropped
+effective fps to 54-56.
+
+Fix: hardcode CVT-RB (reduced-blanking) timing for 1280x800@60Hz, exactly the
+same way the 720p/1080p/1440p/4K cases work:
+   pixel_clock = 71.107 MHz
+   h_total = 1440 (h_active 1280 + h_blank 160)
+   v_total = 823 (v_active 800 + v_blank 23)
+   fps = 71,107,000 / (1440 * 823) = 60.0003 Hz
+
+The Steam Deck now sees an EVDI display that genuinely runs at 60 Hz,
+matching its panel native rate.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -702,6 +702,21 @@
+       v_front = 5;
+       v_sync = 5;
+       pixel_clock_khz = 74250; // 74.25 MHz
++    } else if (width == 1280 && height == 800) {
++      // Steam Deck native @ 60Hz exactly (CVT-RB).
++      // The previous generic CVT branch landed at ~59Hz here, which made
++      // kwin pageflip at 59Hz on the EVDI output and the Steam Deck show
++      // ~54-56 fps (rate mismatch + jitter). Pixel clock 71.107 MHz with
++      // h_total=1440 (h_active 1280 + h_blank 160) and v_total=823
++      // (v_active 800 + v_blank 23) gives exactly 60.0 Hz:
++      //   71_107_000 / (1440 * 823) = 60.0003 Hz
++      h_blank = 160;
++      v_blank = 23;
++      h_front = 48;
++      h_sync = 32;
++      v_front = 3;
++      v_sync = 6;
++      pixel_clock_khz = 71107;  // 71.107 MHz
+     } else {
+       // Generic calculation for other resolutions
+       // Using simplified CVT formula

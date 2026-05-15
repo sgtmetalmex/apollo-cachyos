@@ -1,0 +1,283 @@
+Subject: fps instrumentation at every pipeline stage + 500us EVDI event pump
+
+User reports a stubborn 50/57fps cap (vsync on/off) on plain desktop
+streaming, no game running. All capture-side jitter fixes are in place
+(0009 EDID, 0013/0014 VAAPI, 0018 condvar capture, 0019 quality=1),
+yet moonlight on the Steam Deck still shows ~50-57fps. We need DATA
+about where the loss is actually happening - capture, encoder, or
+network - instead of more theorising.
+
+This patch adds per-stage rate-per-second logging at three points,
+each emitting ONE INFO log line every 5 seconds while streaming:
+
+  1. evdi_events_loop (virtual_display.cpp) - [FPS-EVDI]
+     events_per_sec drained from libevdi, grabs_per_sec, polls_per_sec,
+     average grab_pixels microseconds. If events/sec is much less than
+     the configured fps, kwin is throttling pageflips on the EVDI
+     device. If grab_pixels takes a long time, the kernel ioctl path
+     is slow.
+  2. display_evdi_t::capture (kmsgrab.cpp) - [FPS-CAP]
+     pushed_per_sec to encoder queue, average copy_to() us, average
+     push_captured_image_cb() us, wake-by-event vs wake-by-timeout
+     ratio. If wake_event is 0/sec, kwin never pageflips into the
+     EVDI buffer; the capture loop is purely timeout-driven.
+  3. video::encode_run encoder thread (video.cpp) - [FPS-ENC]
+     popped/sec, encoded/sec, skipped/sec, pop_timeout/sec, average
+     convert microseconds, average encode microseconds. If encoded
+     < popped, the variation-threshold drop path is firing. If
+     avg_encode * fps > 1_000_000us, the VAAPI encoder itself caps
+     the framerate.
+
+That tells us within 5 seconds of streaming whether the cap is at
+EVDI (kwin not pageflipping at 60), capture (slow copy / blocked push),
+or encoder (long encode time, skipped frames).
+
+Also: reduce the libevdi event-pump usleep from 2000us to 500us. The
+pump polls each EVDI handle non-blocking, then sleeps. With 2ms sleep,
+pageflip events can sit up to 2ms before the kernel-side vblank gets
+released - that's 12% of a 60Hz frame budget. With 500us sleep,
+worst-case latency drops to <0.5ms and we still spin at <2000 iter/sec
+(negligible CPU).
+
+diff --git a/src/platform/linux/kmsgrab.cpp b/src/platform/linux/kmsgrab.cpp
+index 84730016..edec28ee 100644
+--- a/src/platform/linux/kmsgrab.cpp
++++ b/src/platform/linux/kmsgrab.cpp
+@@ -1585,6 +1585,17 @@ namespace platf {
+       auto next_frame = std::chrono::steady_clock::now();
+       uint64_t last_fn = buffer_ ? buffer_->frame_number() : 0;
+ 
++      // Patch 0020: per-second rate stats. Helps see whether wait_for_update
++      // is event- or timeout-driven, and whether the slow leg is the
++      // copy_to() memcpy or push_captured_image_cb() (which can block on a
++      // backed-up image queue).
++      auto fps_stats_window_start = std::chrono::steady_clock::now();
++      uint64_t fps_pushed = 0;
++      uint64_t fps_copy_us_total = 0;
++      uint64_t fps_push_us_total = 0;
++      uint64_t fps_wakes_event = 0;
++      uint64_t fps_wakes_timeout = 0;
++
+       while (true) {
+         auto now = std::chrono::steady_clock::now();
+         if (next_frame > now) {
+@@ -1593,7 +1604,13 @@ namespace platf {
+             wait_ms = std::chrono::milliseconds(1);
+           }
+           if (buffer_) {
++            uint64_t prev_fn = last_fn;
+             last_fn = buffer_->wait_for_update(last_fn, wait_ms);
++            if (last_fn > prev_fn) {
++              ++fps_wakes_event;
++            } else {
++              ++fps_wakes_timeout;
++            }
+           } else {
+             std::this_thread::sleep_for(next_frame - now);
+           }
+@@ -1614,13 +1631,40 @@ namespace platf {
+         // Copy the latest BGRA frame from the EVDI buffer into the encoder's
+         // input image. copy_to takes a brief mutex; the libevdi event pump
+         // grab_pixels writes under the same mutex.
++        auto copy_t0 = std::chrono::steady_clock::now();
+         buffer_->copy_to(img_out->data, img_out->row_pitch);
++        auto copy_t1 = std::chrono::steady_clock::now();
++        fps_copy_us_total += std::chrono::duration_cast<std::chrono::microseconds>(copy_t1 - copy_t0).count();
+ 
+         img_out->frame_timestamp = std::chrono::steady_clock::now();
+ 
++        auto push_t0 = std::chrono::steady_clock::now();
+         if (!push_captured_image_cb(std::move(img_out), true)) {
+           return capture_e::ok;
+         }
++        auto push_t1 = std::chrono::steady_clock::now();
++        fps_push_us_total += std::chrono::duration_cast<std::chrono::microseconds>(push_t1 - push_t0).count();
++        ++fps_pushed;
++
++        // Patch 0020: emit per-stage stats every 5 seconds.
++        auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                           std::chrono::steady_clock::now() - fps_stats_window_start).count();
++        if (window_ms >= 5000) {
++          double window_s = window_ms / 1000.0;
++          uint64_t pushed_ps = static_cast<uint64_t>(fps_pushed / window_s);
++          uint64_t avg_copy_us = fps_pushed ? (fps_copy_us_total / fps_pushed) : 0;
++          uint64_t avg_push_us = fps_pushed ? (fps_push_us_total / fps_pushed) : 0;
++          uint64_t wakes_event_ps = static_cast<uint64_t>(fps_wakes_event / window_s);
++          uint64_t wakes_timeout_ps = static_cast<uint64_t>(fps_wakes_timeout / window_s);
++          BOOST_LOG(info) << "[FPS-CAP] pushed=" << pushed_ps
++                          << "/s avg_copy=" << avg_copy_us
++                          << "us avg_push=" << avg_push_us
++                          << "us wake_event=" << wakes_event_ps
++                          << "/s wake_timeout=" << wakes_timeout_ps << "/s";
++          fps_stats_window_start = std::chrono::steady_clock::now();
++          fps_pushed = fps_copy_us_total = fps_push_us_total = 0;
++          fps_wakes_event = fps_wakes_timeout = 0;
++        }
+ 
+         (void) cursor;  // cursor compositing skipped — kwin already renders the cursor into the buffer.
+       }
+diff --git a/src/platform/linux/virtual_display.cpp b/src/platform/linux/virtual_display.cpp
+index 66ed64a0..2ae26cae 100644
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -962,6 +962,15 @@ namespace VDISPLAY {
+     constexpr int MAX_RECTS = 16;
+     evdi_rect rects[MAX_RECTS];
+ 
++    // Patch 0020: per-second rate stats, logged every 5s while we have active
++    // EVDI handles. Helps diagnose whether the fps cap is at the kwin->libevdi
++    // boundary (low events_per_sec) or somewhere downstream.
++    auto stats_window_start = std::chrono::steady_clock::now();
++    uint64_t fps_events_drained = 0;
++    uint64_t fps_grab_calls = 0;
++    uint64_t fps_poll_iters = 0;
++    uint64_t fps_grab_us_total = 0;
++
+     while (evdi_events_running) {
+       // Snapshot active EVDI handles + buf_ids + buffers under the lock,
+       // release before calling into libevdi.
+@@ -989,6 +998,7 @@ namespace VDISPLAY {
+         struct pollfd pfd {};
+         pfd.fd = fd;
+         pfd.events = POLLIN;
++        ++fps_poll_iters;
+         if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+           // We have an event. Dispatch (no-op callback), then drain the
+           // dirty rectangles — that ioctl is what releases the kernel's
+@@ -996,7 +1006,12 @@ namespace VDISPLAY {
+           evdi.handle_events(e.handle, &ctx);
+ 
+           int num_rects = MAX_RECTS;
++          auto grab_t0 = std::chrono::steady_clock::now();
+           evdi.grab_pixels(e.handle, rects, &num_rects);
++          auto grab_t1 = std::chrono::steady_clock::now();
++          fps_grab_us_total += std::chrono::duration_cast<std::chrono::microseconds>(grab_t1 - grab_t0).count();
++          ++fps_grab_calls;
++          ++fps_events_drained;
+ 
+           // The kernel just copied a fresh frame into our registered buffer.
+           // Bump the frame counter so the capture side knows there's new data.
+@@ -1008,7 +1023,32 @@ namespace VDISPLAY {
+         evdi.request_update(e.handle, e.buf_id);
+       }
+ 
+-      usleep(2000);  // 2ms — under half a 240Hz frame, low CPU.
++      // Patch 0020: 500us iteration sleep instead of 2000us. 2000 iter/s is
++      // negligible CPU and cuts worst-case kwin-pageflip -> capture-wakeup
++      // latency from 2ms to 0.5ms.
++      usleep(500);
++
++      // Patch 0020: log per-second rate stats every 5s. If no active EVDI
++      // handles, reset the window so old numbers don't leak into the next run.
++      auto now = std::chrono::steady_clock::now();
++      auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                         now - stats_window_start).count();
++      if (active.empty()) {
++        stats_window_start = now;
++        fps_events_drained = fps_grab_calls = fps_poll_iters = fps_grab_us_total = 0;
++      } else if (window_ms >= 5000) {
++        double window_s = window_ms / 1000.0;
++        uint64_t events_ps = static_cast<uint64_t>(fps_events_drained / window_s);
++        uint64_t grabs_ps = static_cast<uint64_t>(fps_grab_calls / window_s);
++        uint64_t polls_ps = static_cast<uint64_t>(fps_poll_iters / window_s);
++        uint64_t avg_grab_us = fps_grab_calls ? (fps_grab_us_total / fps_grab_calls) : 0;
++        BOOST_LOG(info) << "[FPS-EVDI] events=" << events_ps
++                        << "/s grabs=" << grabs_ps
++                        << "/s polls=" << polls_ps
++                        << "/s avg_grab=" << avg_grab_us << "us";
++        stats_window_start = now;
++        fps_events_drained = fps_grab_calls = fps_poll_iters = fps_grab_us_total = 0;
++      }
+     }
+   }
+ 
+diff --git a/src/video.cpp b/src/video.cpp
+index 8962609a..f4565ac3 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -2000,6 +2000,15 @@ namespace video {
+ 
+     std::chrono::steady_clock::time_point encode_frame_timestamp;
+ 
++    // Patch 0020: per-stage rate stats for the encoder thread. Logged every 5s.
++    auto fps_stats_window_start = std::chrono::steady_clock::now();
++    uint64_t fps_popped = 0;
++    uint64_t fps_encoded = 0;
++    uint64_t fps_skipped = 0;
++    uint64_t fps_pop_timeouts = 0;
++    uint64_t fps_convert_us = 0;
++    uint64_t fps_encode_us = 0;
++
+     while (true) {
+       // Break out of the encoding loop if any of the following are true:
+       // a) The stream is ending
+@@ -2034,6 +2043,7 @@ namespace video {
+       // Encode at a minimum FPS to avoid image quality issues with static content
+       if (!requested_idr_frame || images->peek()) {
+         if (auto img = images->pop(max_frametime)) {
++          ++fps_popped;
+           frame_timestamp = img->frame_timestamp;
+           if (!frame_timestamp) {
+             frame_timestamp = std::chrono::steady_clock::now();
+@@ -2044,13 +2054,17 @@ namespace video {
+ 
+           // If new frame comes in way too fast, just drop
+           if (time_diff < -frame_variation_threshold) {
++            ++fps_skipped;
+             continue;
+           }
+ 
++          auto cvt_t0 = std::chrono::steady_clock::now();
+           if (session->convert(*img)) {
+             BOOST_LOG(error) << "Could not convert image"sv;
+             break;
+           }
++          auto cvt_t1 = std::chrono::steady_clock::now();
++          fps_convert_us += std::chrono::duration_cast<std::chrono::microseconds>(cvt_t1 - cvt_t0).count();
+ 
+           if (time_diff < frame_variation_threshold) {
+             *frame_timestamp = encode_frame_timestamp;
+@@ -2061,15 +2075,43 @@ namespace video {
+           encode_frame_timestamp += encode_frame_threshold;
+         } else if (!images->running()) {
+           break;
++        } else {
++          ++fps_pop_timeouts;
+         }
+       }
+ 
++      auto enc_t0 = std::chrono::steady_clock::now();
+       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+         BOOST_LOG(error) << "Could not encode video packet"sv;
+         break;
+       }
++      auto enc_t1 = std::chrono::steady_clock::now();
++      fps_encode_us += std::chrono::duration_cast<std::chrono::microseconds>(enc_t1 - enc_t0).count();
++      ++fps_encoded;
+ 
+       session->request_normal_frame();
++
++      // Patch 0020: emit per-stage stats every 5s.
++      auto fps_window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                             std::chrono::steady_clock::now() - fps_stats_window_start).count();
++      if (fps_window_ms >= 5000) {
++        double window_s = fps_window_ms / 1000.0;
++        uint64_t popped_ps = static_cast<uint64_t>(fps_popped / window_s);
++        uint64_t encoded_ps = static_cast<uint64_t>(fps_encoded / window_s);
++        uint64_t skipped_ps = static_cast<uint64_t>(fps_skipped / window_s);
++        uint64_t timeouts_ps = static_cast<uint64_t>(fps_pop_timeouts / window_s);
++        uint64_t avg_cvt_us = fps_popped ? (fps_convert_us / fps_popped) : 0;
++        uint64_t avg_enc_us = fps_encoded ? (fps_encode_us / fps_encoded) : 0;
++        BOOST_LOG(info) << "[FPS-ENC] popped=" << popped_ps
++                        << "/s encoded=" << encoded_ps
++                        << "/s skipped=" << skipped_ps
++                        << "/s pop_timeout=" << timeouts_ps
++                        << "/s avg_convert=" << avg_cvt_us
++                        << "us avg_encode=" << avg_enc_us << "us";
++        fps_stats_window_start = std::chrono::steady_clock::now();
++        fps_popped = fps_encoded = fps_skipped = fps_pop_timeouts = 0;
++        fps_convert_us = fps_encode_us = 0;
++      }
+     }
+   }
+ 

@@ -1,0 +1,51 @@
+Subject: Web UI: unhide Resolution Scale Factor slider on Linux
+
+Apollo's per-app config form (apps.html) gates the Resolution Scale Factor
+slider with:
+
+    <div class="mb-3" v-if="platform === 'windows'">
+      <label for="resolutionScaleFactor">...</label>
+      <input type="range" ... v-model="editForm['scale-factor']"/>
+    </div>
+
+So the entire slider is hidden when the host is not Windows. But the backend
+plumbing for `scale-factor` is fully present in the Linux build:
+
+    process.cpp:200  int scale_factor = launch_session->scale_factor;
+    process.cpp:201  if (_app.scale_factor != 100) { scale_factor = _app.scale_factor; }
+    process.cpp:205  if (scale_factor != 100) {
+    process.cpp:206    render_width  *= ((float)scale_factor / 100);
+    process.cpp:207    render_height *= ((float)scale_factor / 100);
+    process.cpp:215  launch_session->width  = render_width;
+    process.cpp:216  launch_session->height = render_height;
+    process.cpp:309  VDISPLAY::createVirtualDisplay(... render_width, render_height ...);
+
+Combined with patch 0007 (display_evdi_t reading the EVDI CPU buffer at the
+configured size), supersampling works on Linux exactly like on Windows:
+client requests 1280x800, scale-factor=150% renders the EVDI virtual display
+at 1920x1200, encoder downscales for the wire. Sharper streams.
+
+Fix: drop the platform === 'windows' gate. The slider now shows on Linux
+(and macOS, for that matter — same backend code path).
+
+apps.json `scale-factor` already defaults to 100 (no-op), so existing
+configs are unaffected.
+
+--- a/src_assets/common/assets/web/apps.html
++++ b/src_assets/common/assets/web/apps.html
+@@ -404,7 +404,14 @@
+                   default="false"
+         ></Checkbox>
+         <!-- resolution scale factor -->
+-        <div class="mb-3" v-if="platform === 'windows'">
++        <!-- Previously gated to platform === 'windows'. The backend
++             (process.cpp:200-216) supports scale_factor on Linux too:
++             it scales render_width/height before passing them to
++             VDISPLAY::createVirtualDisplay, so the EVDI virtual display
++             is created at the supersampled resolution and downscaled by
++             the encoder for the client. Removing the platform gate so
++             Linux users can use it from the web UI. -->
++        <div class="mb-3">
+           <label for="resolutionScaleFactor" class="form-label">{{ $t('apps.resolution_scale_factor') }}: {{editForm['scale-factor']}}%</label>
+           <input type="range" step="1" min="20" max="200" class="form-range" id="resolutionScaleFactor" v-model="editForm['scale-factor']"/>
+           <div class="form-text">{{ $t('apps.resolution_scale_factor_desc') }}</div>

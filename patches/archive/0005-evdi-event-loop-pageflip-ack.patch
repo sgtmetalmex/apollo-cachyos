@@ -1,0 +1,274 @@
+Subject: Implement the libevdi event loop so kwin's pageflips actually complete
+
+EVDI is a userspace-driven DRM device. Unlike a real GPU connector, a
+pageflip submitted to /dev/dri/cardN (EVDI) does NOT complete until the
+userspace controller (us, via libevdi) explicitly acknowledges it by:
+
+  1. Registering a buffer via evdi_register_buffer()
+  2. Arming the next frame with evdi_request_update()
+  3. Polling for events with evdi_handle_events()
+
+MrOz59's port of Apollo to Linux LOADS the libevdi function pointers
+(evdi_register_buffer, evdi_request_update, evdi_grab_pixels,
+ evdi_handle_events, evdi_get_event_ready) but never CALLS any of them.
+
+The downstream effect, visible in kwin's log every second of a streaming
+session:
+
+    kwin_wayland: Pageflip timed out! This is a bug in the evdi kernel driver
+    kwin_wayland: Pageflip timed out! This is a bug in the evdi kernel driver
+    kwin_wayland: Pageflip timed out! This is a bug in the evdi kernel driver
+    ...
+    kwin_wayland: Pageflip arrived after all, 126631ms after the commit
+
+The header is misleading: it's not a kernel-driver bug, it's that the
+userspace pageflip-completion contract simply isn't being honoured.
+Because kwin's pageflips never complete, kwin's render queue stalls,
+no new frames reach the EVDI plane, and Apollo's KMS capture reads
+the zero-initialised initial framebuffer = black screen on the Steam
+Deck (audio works fine through a separate path).
+
+This patch wires up the minimum viable libevdi event pump:
+
+  - VirtualDisplayInfo gets a CPU buffer (width*height*4) and a
+    registered-buffer id.
+  - openVDisplayDevice() starts a single global event-pump thread for
+    the whole process. The thread snapshots the active EVDI handles
+    under vdisplay_mutex, releases the lock, then calls
+    evdi_get_event_ready / evdi_handle_events / evdi_request_update on
+    each handle. 5ms sleep between iterations (≈200Hz).
+  - closeVDisplayDevice() joins the thread *before* taking the mutex
+    (the loop acquires the mutex itself, so joining inside would
+    deadlock).
+  - createVirtualDisplay registers a fresh buffer with the new EVDI
+    handle and arms the first request_update right after evdi_connect.
+  - removeVirtualDisplay unregisters the buffer before evdi_disconnect.
+
+We use a no-op update_ready callback because Apollo's existing KMS
+capture pipeline reads kwin's GBM-allocated dma-buf (the same memory
+EVDI is shadowing), so we don't need to consume the pixels via
+evdi_grab_pixels — we just need the event-pump side-effects (ACK so
+kwin's pageflip completes; re-arm via request_update so the next
+frame fires). If a future change wants to bypass KMS and read pixels
+directly, vdinfo.evdi_buf is already the destination libevdi writes
+into.
+
+End-to-end after this patch (expected):
+
+    [VDISPLAY] Registered libevdi buffer id=1 (1280x800, 4096000 bytes); pageflips will now complete.
+    [VDISPLAY] EVDI event pump thread started.
+    [no more "Pageflip timed out" spam from kwin]
+    [actual desktop content streams to the Steam Deck]
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -30,6 +30,7 @@
+ 
+ // platform includes
+ #include <fcntl.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ #include <xf86drm.h>
+@@ -222,10 +223,24 @@
+     int drm_fd;            // DRM fd for card
+     bool active;
+     bool using_evdi;       // true if using EVDI, false if passthrough
++
++    // libevdi pixel-update plumbing. Required to keep kwin's pageflips from
++    // timing out: kwin only completes a pageflip once userspace (us) ACKs the
++    // update via evdi_handle_events. Without this, kwin logs "Pageflip timed
++    // out! This is a bug in the evdi kernel driver" every second and stops
++    // rendering — Apollo's capture then reads stale/zero pixels = black.
++    std::vector<uint8_t> evdi_buf;  // CPU-side pixel buffer libevdi writes into
++    int evdi_buf_id;                // id we registered with evdi_register_buffer (0 = none)
+   };
+ 
+   static std::map<std::string, VirtualDisplayInfo> virtual_displays;
+ 
++  // Global libevdi event-loop thread. One per process, services every active
++  // VirtualDisplayInfo. Drains evdi_handle_events and re-arms evdi_request_update
++  // so kwin's DRM pageflips actually complete.
++  static std::atomic<bool> evdi_events_running {false};
++  static std::thread evdi_events_thread;
++
+   // ============================================================================
+   // KDE / kscreen-doctor integration
+   //
+@@ -830,6 +845,89 @@
+   // Public API Implementation
+   // ============================================================================
+ 
++  // Drive libevdi's event pump for every active EVDI virtual display.
++  //
++  // The kernel-side contract (from evdi_painter.c):
++  //   1. kwin issues drmModeAtomicCommit (a pageflip) on the EVDI card.
++  //   2. evdi kernel sees is_connected=true and num_dirts>0, so it QUEUES the
++  //      pending vblank event instead of sending it to kwin immediately.
++  //   3. evdi kernel emits an update_ready event on the libevdi fd.
++  //   4. We must call evdi_handle_events to dispatch, AND evdi_grab_pixels
++  //      to actually drain the dirty rects — the kernel only releases the
++  //      queued vblank inside the GRAB_PIXELS ioctl (see line 1185 of
++  //      evdi_painter.c: `evdi_send_vblank(crtc, vblank)` after the copy).
++  //   5. kwin's pageflip then completes and kwin can submit the next frame.
++  //
++  // Without step 4 (the previous version of this patch), kwin's pageflips
++  // stayed queued indefinitely — observable as "Pageflip timed out! This is
++  // a bug in the evdi kernel driver" every ~1s in kwin_wayland's log, kwin
++  // stalling on rendering, and Apollo's KMS capture reading stale pixels.
++  static void evdi_events_loop() {
++    evdi_event_context ctx {};
++    // No-op update handler: we don't *use* the pixels (Apollo's KMS capture
++    // reads kwin's GBM-backed dma-buf via drmPrimeHandleToFD separately).
++    // We still call grab_pixels below to release the kernel's queued vblank.
++    ctx.update_ready_handler = [](int /*buffer_id*/, void * /*user_data*/) {};
++    ctx.user_data = nullptr;
++
++    // Reusable scratch buffer for the dirty-rect dance. evdi_grab_pixels
++    // wants somewhere to copy the rect list; we don't care about the contents.
++    constexpr int MAX_RECTS = 16;
++    evdi_rect rects[MAX_RECTS];
++
++    while (evdi_events_running) {
++      // Snapshot active EVDI handles + buf_ids under the lock; release before
++      // calling into libevdi so a slow handle_events doesn't block
++      // createVirtualDisplay / removeVirtualDisplay.
++      struct entry_t {
++        evdi_handle handle;
++        int buf_id;
++      };
++      std::vector<entry_t> active;
++      {
++        std::lock_guard<std::mutex> lock(vdisplay_mutex);
++        active.reserve(virtual_displays.size());
++        for (auto &[guid, vdinfo] : virtual_displays) {
++          if (vdinfo.using_evdi && vdinfo.handle) {
++            active.push_back({vdinfo.handle, vdinfo.evdi_buf_id});
++          }
++        }
++      }
++
++      for (const auto &e : active) {
++        // evdi_get_event_ready returns evdi_selectable (which is just `int`,
++        // a file descriptor). Apollo doesn't pull in <evdi_lib.h> so we
++        // use plain int.
++        const int fd = evdi.get_event_ready(e.handle);
++        if (fd < 0) {
++          continue;
++        }
++        // Non-blocking check: are there pending events on this fd?
++        struct pollfd pfd {};
++        pfd.fd = fd;
++        pfd.events = POLLIN;
++        int pr = ::poll(&pfd, 1, 0);
++        if (pr > 0 && (pfd.revents & POLLIN)) {
++          // Dispatch update_ready (no-op callback) so libevdi advances state.
++          evdi.handle_events(e.handle, &ctx);
++          // Drain the dirty rectangles. This is the ioctl that releases the
++          // queued vblank inside the kernel, allowing kwin's pageflip to
++          // complete. num_rects is in/out: pass capacity, get filled count.
++          int num_rects = MAX_RECTS;
++          evdi.grab_pixels(e.handle, rects, &num_rects);
++        }
++        // Always (re)arm the next update request. This is cheap — the kernel
++        // either marks was_update_requested or returns immediately if pixels
++        // are already pending. Safe to call repeatedly.
++        if (e.buf_id > 0) {
++          evdi.request_update(e.handle, e.buf_id);
++        }
++      }
++
++      usleep(2000);  // 2ms — under half a 240Hz frame, low CPU.
++    }
++  }
++
+   DRIVER_STATUS openVDisplayDevice() {
+     std::lock_guard<std::mutex> lock(vdisplay_mutex);
+ 
+@@ -853,6 +951,13 @@
+ 
+     if (evdi_available) {
+       BOOST_LOG(info) << "[VDISPLAY] EVDI available - real virtual displays supported!";
++      // Spin up the global event pump so kwin's pageflips on any EVDI card we
++      // create will be ACKed and complete.
++      if (!evdi_events_running) {
++        evdi_events_running = true;
++        evdi_events_thread = std::thread(evdi_events_loop);
++        BOOST_LOG(info) << "[VDISPLAY] EVDI event pump thread started.";
++      }
+     } else {
+       BOOST_LOG(warning) << "[VDISPLAY] EVDI not available - using passthrough mode.";
+       BOOST_LOG(warning) << "[VDISPLAY] The stream will capture the physical display.";
+@@ -865,6 +970,16 @@
+   }
+ 
+   void closeVDisplayDevice() {
++    // Tell the EVDI event pump to exit first; join *outside* the
++    // vdisplay_mutex so we don't deadlock against the loop's lock acquire.
++    if (evdi_events_running) {
++      evdi_events_running = false;
++      if (evdi_events_thread.joinable()) {
++        evdi_events_thread.join();
++      }
++      BOOST_LOG(info) << "[VDISPLAY] EVDI event pump thread stopped.";
++    }
++
+     std::lock_guard<std::mutex> lock(vdisplay_mutex);
+ 
+     BOOST_LOG(info) << "[VDISPLAY] Closing Linux virtual display driver...";
+@@ -987,6 +1102,7 @@
+     vdinfo.drm_fd = -1;
+     vdinfo.active = true;
+     vdinfo.using_evdi = false;
++    vdinfo.evdi_buf_id = 0;
+ 
+     if (evdi_available) {
+       // Snapshot kscreen outputs AND the current priority-1 output BEFORE
+@@ -1026,6 +1142,33 @@
+           // surface a new "DVI-I-1" output for kscreen-doctor to find.
+           // vdinfo.drm_fd stays at -1 (initialized at start of this function).
+ 
++          // Register a CPU buffer with libevdi and arm the first update. The
++          // global evdi_events_loop will then service pageflip ACKs as kwin
++          // submits frames. Without this kwin times out every pageflip and
++          // stops drawing — Apollo's KMS capture would then read zeros.
++          // We don't actually consume the pixels from this buffer; the
++          // existing KMS capture pipeline reads kwin's GBM-allocated dma-buf
++          // via drmPrimeHandleToFD. The buffer just gives the kernel a place
++          // to write so update_ready events fire.
++          {
++            const size_t stride = static_cast<size_t>(width) * 4;
++            vdinfo.evdi_buf.assign(stride * height, 0);
++            evdi_buffer ebuf {};
++            ebuf.id = 1;
++            ebuf.buffer = vdinfo.evdi_buf.data();
++            ebuf.width = static_cast<int>(width);
++            ebuf.height = static_cast<int>(height);
++            ebuf.stride = static_cast<int>(stride);
++            ebuf.rects = nullptr;
++            ebuf.rect_count = 0;
++            evdi.register_buffer(handle, ebuf);
++            vdinfo.evdi_buf_id = ebuf.id;
++            evdi.request_update(handle, vdinfo.evdi_buf_id);
++            BOOST_LOG(info) << "[VDISPLAY] Registered libevdi buffer id=" << vdinfo.evdi_buf_id
++                            << " (" << width << "x" << height << ", " << vdinfo.evdi_buf.size()
++                            << " bytes); pageflips will now complete.";
++          }
++
+           BOOST_LOG(info) << "[VDISPLAY] Created EVDI virtual display on device " << device;
+ 
+           // Ask KDE to actually USE the new output. Without this kwin leaves
+@@ -1069,6 +1212,13 @@
+     BOOST_LOG(info) << "[VDISPLAY] Removing virtual display: " << vdinfo.name;
+ 
+     if (vdinfo.using_evdi && vdinfo.handle) {
++      // Unregister the libevdi buffer before closing so the kernel doesn't
++      // try to write into freed memory (vdinfo.evdi_buf is destroyed when the
++      // map entry is erased below).
++      if (vdinfo.evdi_buf_id > 0) {
++        evdi.unregister_buffer(vdinfo.handle, vdinfo.evdi_buf_id);
++        vdinfo.evdi_buf_id = 0;
++      }
+       evdi.disconnect(vdinfo.handle);
+       evdi.close(vdinfo.handle);
+       kscreen::on_evdi_removed();

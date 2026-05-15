@@ -1,0 +1,55 @@
+Subject: vaapi: force VBR + single-frame VBV on AMD (default was uncontrolled CQP)
+
+Upstream Apollo's VAAPI encoder rate-control selection branch (vaapi.cpp:
+271-291) opts into "VBR with single-frame VBV" only for:
+  - users who explicitly set vaapi.strict_rc_buffer = true
+  - Intel iGPUs (drm driver vendor contains "Intel")
+  - AV1 (any vendor)
+
+For an AMD Radeon GPU the branch falls through to the "Using default rate
+control" path which DOES NOT set rc_mode. ffmpeg's h264_vaapi /
+hevc_vaapi default on AMD radeonsi is CQP — constant-quantizer, no
+bitrate target. So moonlight tells the user "20 Mbps configured" but the
+encoder happily ships 60-80 Mbps bursts on complex frames.
+
+The Steam Deck's HEVC decoder choke point is around 35 Mbps on Wi-Fi;
+above that it drops frames and the client-side jitter buffer keeps
+extending, which the user perceives as "stream is slow / not smooth"
+even though host-side fps is 60.
+
+Fix: add `(vendor && (strstr(vendor, "AMD") || strstr(vendor, "Mesa")))`
+to the VBR-eligible-vendor predicate. The mesa string check catches
+`radv` advertising as `RADV` or `radeonsi` advertising as `AMD` or
+`Mesa` depending on driver build. Existing "strict_rc_buffer = true"
+user override still works.
+
+After this patch:
+- AMD VAAPI rate-controls to the configured bitrate.
+- Single-frame VBV caps per-frame bytes to bitrate/fps, killing spikes.
+- "Using VBR with single frame VBV size" log line appears at probe.
+- Stream smoothness improves substantially on Wi-Fi.
+
+If the user wants CQP back (e.g. for max-quality on wired LAN with
+unconstrained bandwidth), they can still opt out by setting
+`vaapi.strict_rc_buffer = false` AND patching the predicate locally —
+but the new default is much safer for actual streaming.
+
+--- a/src/platform/linux/vaapi.cpp
++++ b/src/platform/linux/vaapi.cpp
+@@ -268,8 +268,15 @@
+       // When we have to resort to the default 1 second VBV for encoding quality reasons,
+       // we stick to CBR in order to avoid encoding huge frames after bitrate undershoots
+       // leave headroom available in the RC window.
++      // AMD radeonsi's ffmpeg-vaapi default is CQP, which means bitrate is
++      // uncontrolled — moonlight reports e.g. "20 Mbps configured" but the
++      // encoder ships 60-80 Mbps spikes that overrun Wi-Fi and the Steam
++      // Deck's HEVC decoder. We force VBR + single-frame VBV on AMD as
++      // well as Intel and AV1 so the bitrate setting actually means
++      // something. Without this the user observed the stream as "slow /
++      // not smooth" even at 60fps (rate overshoots → decoder stalls).
+       if (config::video.vaapi.strict_rc_buffer ||
+-          (vendor && strstr(vendor, "Intel")) ||
++          (vendor && (strstr(vendor, "Intel") || strstr(vendor, "AMD") || strstr(vendor, "Mesa"))) ||
+           ctx->codec_id == AV_CODEC_ID_AV1) {
+         ctx->rc_buffer_size = ctx->bit_rate * ctx->framerate.den / ctx->framerate.num;
+ 

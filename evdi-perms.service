@@ -1,0 +1,15 @@
+[Unit]
+Description=Allow video group to add/remove EVDI virtual displays
+Documentation=https://github.com/MrOz59/Apollo-Linux
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+ConditionPathExists=/sys/devices/evdi/add
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/chgrp video /sys/devices/evdi/add /sys/devices/evdi/remove_all
+ExecStart=/bin/chmod 0220 /sys/devices/evdi/add /sys/devices/evdi/remove_all
+
+[Install]
+WantedBy=multi-user.target

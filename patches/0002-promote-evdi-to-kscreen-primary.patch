@@ -1,0 +1,331 @@
+Subject: Enable & promote the new EVDI output to primary via kscreen-doctor
+
+Background: MrOz59-Apollo creates an EVDI virtual display via libevdi
+(evdi_add_device + evdi_connect with EDID), but does nothing to tell the
+desktop compositor to actually USE the new output. On KDE Plasma Wayland
+kwin enumerates the new connector but leaves the output disabled.
+
+The downstream effect: Apollo's KMS screencast (kmsgrab.cpp) scans every
+/dev/dri/cardN for DRM planes with an attached framebuffer. The EVDI card
+has zero planes-with-fb because no compositor draws to it, so KMS capture
+falls through to the physical GPU and the Steam Deck ends up streaming the
+host's primary monitor instead of a separate virtual desktop.
+
+This patch shells out to `kscreen-doctor` after evdi_connect succeeds:
+
+  1. Snapshot the set of connected outputs BEFORE add+connect.
+  2. After evdi_connect, poll kscreen-doctor -j (up to ~3s) for an output
+     that is now present but was not before — that is the new EVDI output.
+  3. Run:  kscreen-doctor output.<new>.enable output.<new>.priority.1 \
+                          output.<old_primary>.priority.2
+     This makes kwin actually render desktop content to the EVDI framebuffer,
+     which is what kmsgrab then captures.
+  4. On removeVirtualDisplay() (refcounted, last-out-restores), put the
+     original primary back to priority 1.
+
+Defenses:
+  - All output names are validated against a strict [A-Za-z0-9_-]{1,64}
+    allowlist before being interpolated into a shell command.
+  - If kscreen-doctor isn't installed or the JSON parse fails, we log a
+    warning and continue — non-KDE users still get the EVDI device created
+    (the first patch's behavior).
+  - Static refcount + mutex so two simultaneous virtual displays don't
+    each "restore" the primary at the wrong moment.
+
+After this patch, Apollo's Linux EVDI path delivers what users expect:
+the Steam Deck sees a separate 1280x800 virtual desktop, and the host's
+3440x1440 primary monitor is left undisturbed for the duration of the
+streaming session.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -11,16 +11,23 @@
+  */
+ 
+ // standard includes
++#include <array>
+ #include <atomic>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <dlfcn.h>
+ #include <filesystem>
+ #include <fstream>
+ #include <map>
+ #include <mutex>
++#include <set>
+ #include <thread>
+ #include <vector>
+ 
++// third-party includes
++#include <nlohmann/json.hpp>
++
+ // platform includes
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
+@@ -220,6 +227,230 @@
+   static std::map<std::string, VirtualDisplayInfo> virtual_displays;
+ 
+   // ============================================================================
++  // KDE / kscreen-doctor integration
++  //
++  // EVDI alone is not enough on KDE Plasma Wayland: kwin detects the new
++  // connector (via DRM uevent) but leaves the corresponding output disabled,
++  // so no compositor draws frames to it and Apollo's KMS screencast captures
++  // the physical display instead. We shell out to `kscreen-doctor` to enable
++  // the new output and promote it to priority-1 (primary) for the duration of
++  // the streaming session, then restore the original primary on teardown.
++  //
++  // Degrades gracefully on non-KDE systems: if kscreen-doctor is missing or
++  // returns invalid JSON, we log once and skip the promotion (the EVDI device
++  // is still created — first patch's behavior).
++  // ============================================================================
++
++  namespace kscreen {
++
++    static std::mutex state_mutex;
++    static int evdi_active_count = 0;
++    static std::string saved_primary;
++
++    static std::string run_capture(const std::string &cmd) {
++      std::array<char, 4096> buf {};
++      std::string out;
++      FILE *p = popen(cmd.c_str(), "r");
++      if (!p) {
++        BOOST_LOG(warning) << "[VDISPLAY/kscreen] popen() failed for: " << cmd
++                           << " (errno=" << errno << ")";
++        return "";
++      }
++      while (fgets(buf.data(), static_cast<int>(buf.size()), p)) {
++        out += buf.data();
++      }
++      int rc = pclose(p);
++      if (rc != 0) {
++        BOOST_LOG(warning) << "[VDISPLAY/kscreen] command exited non-zero (rc=" << rc
++                           << "): " << cmd << " — captured " << out.size() << " bytes";
++        return "";
++      }
++      return out;
++    }
++
++    static int run_status(const std::string &cmd) {
++      return std::system((cmd + " >/dev/null 2>&1").c_str());
++    }
++
++    // kscreen output names come from libdrm connector names (e.g. "DP-3",
++    // "HDMI-A-1", "DVI-I-1"). Validate strictly before shell interpolation.
++    static bool is_safe_name(const std::string &n) {
++      if (n.empty() || n.size() > 64) {
++        return false;
++      }
++      for (char c : n) {
++        const bool ok = (c >= 'A' && c <= 'Z')
++                     || (c >= 'a' && c <= 'z')
++                     || (c >= '0' && c <= '9')
++                     || c == '-' || c == '_';
++        if (!ok) {
++          return false;
++        }
++      }
++      return true;
++    }
++
++    struct Output {
++      std::string name;
++      bool connected = false;
++      bool enabled = false;
++      int priority = 0;
++    };
++
++    static std::vector<Output> get_outputs() {
++      std::vector<Output> result;
++      // Note: NOT redirecting stderr — we want to see kscreen-doctor errors in apollo's log.
++      std::string js = run_capture("kscreen-doctor -j");
++      if (js.empty()) {
++        return result;
++      }
++      try {
++        auto data = nlohmann::json::parse(js);
++        if (!data.contains("outputs")) {
++          BOOST_LOG(warning) << "[VDISPLAY/kscreen] JSON has no 'outputs' key. Raw len=" << js.size();
++          return result;
++        }
++        for (const auto &o : data["outputs"]) {
++          Output k;
++          k.name = o.value("name", std::string {});
++          k.connected = o.value("connected", false);
++          k.enabled = o.value("enabled", false);
++          k.priority = o.value("priority", 0);
++          if (!k.name.empty()) {
++            result.push_back(std::move(k));
++          }
++        }
++      } catch (const std::exception &e) {
++        BOOST_LOG(warning) << "[VDISPLAY/kscreen] JSON parse failed: " << e.what()
++                           << " (first 200 chars of stdout: "
++                           << js.substr(0, 200) << ")";
++      }
++      return result;
++    }
++
++    static std::string current_primary() {
++      for (const auto &o : get_outputs()) {
++        if (o.priority == 1 && o.enabled && o.connected) {
++          return o.name;
++        }
++      }
++      return "";
++    }
++
++    static std::set<std::string> connected_names() {
++      std::set<std::string> s;
++      for (const auto &o : get_outputs()) {
++        if (o.connected) {
++          s.insert(o.name);
++        }
++      }
++      return s;
++    }
++
++    // Poll kscreen for a new connected output that wasn't there before, then
++    // enable it and make it priority-1. Refcounts so concurrent sessions don't
++    // each save/restore the primary independently.
++    //
++    // `original_primary` MUST be captured by the caller BEFORE evdi_connect()
++    // — kscreen "remembers" the last priority of each connector by id, so a
++    // reconnecting EVDI output is auto-promoted back to priority 1 almost
++    // immediately, and capturing the primary post-connect would just see the
++    // EVDI output again (the bug we hit on the second streaming session).
++    static void promote_new_evdi_to_primary(const std::set<std::string> &outputs_before,
++                                            const std::string &original_primary) {
++      {
++        std::string before_list;
++        for (const auto &n : outputs_before) {
++          before_list += n + ",";
++        }
++        BOOST_LOG(info) << "[VDISPLAY/kscreen] polling for new output. before=["
++                        << before_list << "] original_primary=[" << original_primary << "]";
++      }
++
++      std::string new_name;
++      std::set<std::string> last_seen;
++      for (int i = 0; i < 30; ++i) {
++        usleep(100000);  // 100ms; ~3s ideal, longer in practice due to popen overhead
++        last_seen = connected_names();
++        for (const auto &n : last_seen) {
++          if (outputs_before.find(n) == outputs_before.end()) {
++            new_name = n;
++            break;
++          }
++        }
++        if (!new_name.empty()) {
++          break;
++        }
++      }
++
++      {
++        std::string seen_list;
++        for (const auto &n : last_seen) {
++          seen_list += n + ",";
++        }
++        BOOST_LOG(info) << "[VDISPLAY/kscreen] poll done. last_seen=["
++                        << seen_list << "] new_name=[" << new_name << "]";
++      }
++
++      if (new_name.empty()) {
++        BOOST_LOG(warning) << "[VDISPLAY] kscreen did not report a new connected output after "
++                              "EVDI connect — skipping primary-promote. Stream may still capture "
++                              "the physical display. (Is kscreen-doctor installed / KDE running?)";
++        return;
++      }
++      if (!is_safe_name(new_name)) {
++        BOOST_LOG(warning) << "[VDISPLAY] kscreen output name rejected: " << new_name;
++        return;
++      }
++
++      std::lock_guard<std::mutex> lk(state_mutex);
++      if (evdi_active_count == 0) {
++        // Defensive: if original_primary is the same as new_name (shouldn't
++        // happen since we captured it before evdi_connect), don't save it —
++        // we'd otherwise try to restore the EVDI output as primary on teardown,
++        // which means desktop never comes back to the physical display.
++        if (original_primary == new_name) {
++          BOOST_LOG(warning) << "[VDISPLAY/kscreen] original_primary == new_name == " << new_name
++                             << "; not saving (would deadlock restore on session end)";
++          saved_primary.clear();
++        } else {
++          saved_primary = original_primary;
++        }
++      }
++      ++evdi_active_count;
++
++      BOOST_LOG(info) << "[VDISPLAY] Promoting new EVDI output to primary: " << new_name
++                      << " (saved old primary: "
++                      << (saved_primary.empty() ? "<none>" : saved_primary) << ")";
++
++      std::string cmd = "kscreen-doctor output." + new_name + ".enable output." + new_name + ".priority.1";
++      if (!saved_primary.empty() && is_safe_name(saved_primary)) {
++        cmd += " output." + saved_primary + ".priority.2";
++      }
++      const int rc = run_status(cmd);
++      if (rc != 0) {
++        BOOST_LOG(warning) << "[VDISPLAY] kscreen-doctor command failed (rc=" << rc << "): " << cmd;
++      }
++    }
++
++    static void on_evdi_removed() {
++      std::lock_guard<std::mutex> lk(state_mutex);
++      if (evdi_active_count > 0) {
++        --evdi_active_count;
++      }
++      if (evdi_active_count == 0 && !saved_primary.empty()) {
++        if (is_safe_name(saved_primary)) {
++          const std::string cmd = "kscreen-doctor output." + saved_primary + ".priority.1";
++          run_status(cmd);
++          BOOST_LOG(info) << "[VDISPLAY] Restored kscreen primary to: " << saved_primary;
++        }
++        saved_primary.clear();
++      }
++    }
++
++  }  // namespace kscreen
++
++  // ============================================================================
+   // EVDI Library Loading
+   // ============================================================================
+ 
+@@ -758,6 +989,14 @@
+     vdinfo.using_evdi = false;
+ 
+     if (evdi_available) {
++      // Snapshot kscreen outputs AND the current priority-1 output BEFORE
++      // evdi_add/connect. kscreen remembers per-connector priority and will
++      // auto-promote a reconnecting EVDI output back to priority 1 almost
++      // immediately, so we must capture the "real" primary now while the EVDI
++      // output is still gone.
++      auto outputs_before = kscreen::connected_names();
++      auto original_primary = kscreen::current_primary();
++
+       // Create real virtual display using EVDI
+       int device = find_available_evdi_device();
+       if (device >= 0) {
+@@ -788,6 +1027,11 @@
+           // vdinfo.drm_fd stays at -1 (initialized at start of this function).
+ 
+           BOOST_LOG(info) << "[VDISPLAY] Created EVDI virtual display on device " << device;
++
++          // Ask KDE to actually USE the new output. Without this kwin leaves
++          // it disabled, no fb gets attached to its DRM planes, and Apollo's
++          // KMS screencast falls through to the physical display.
++          kscreen::promote_new_evdi_to_primary(outputs_before, original_primary);
+         } else {
+           BOOST_LOG(warning) << "[VDISPLAY] Failed to open EVDI device " << device;
+         }
+@@ -827,6 +1071,7 @@
+     if (vdinfo.using_evdi && vdinfo.handle) {
+       evdi.disconnect(vdinfo.handle);
+       evdi.close(vdinfo.handle);
++      kscreen::on_evdi_removed();
+     }
+ 
+     if (vdinfo.drm_fd >= 0) {
