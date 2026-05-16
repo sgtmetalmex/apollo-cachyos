@@ -1,6 +1,7 @@
 # makepkg / build artifacts — recreated on every `makepkg` run
 src/
 pkg/
+apollo/
 *.pkg.tar.zst
 *.pkg.tar.xz
 *.log

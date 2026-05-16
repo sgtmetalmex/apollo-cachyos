@@ -161,32 +161,21 @@ _pkgsrc="$_pkgname"
 #     SIGKILL / OOM / power-loss.
 source=(
   "$_pkgsrc"::"git+https://github.com/MrOz59/Apollo-Linux.git#branch=main"
-  "patches/0001-fix-evdi-device-index.patch"
-  "patches/0002-promote-evdi-to-kscreen-primary.patch"
-  "patches/0003-drop-spurious-drm-open.patch"
-  "patches/0004-kmsgrab-fallback-for-hotplugged-evdi.patch"
-  "patches/0007-evdi-cpu-buffer-capture-backend.patch"
-  "patches/0008-disable-physical-primary-during-stream.patch"
-  "patches/0009-edid-exact-60hz-1280x800.patch"
-  "patches/0010-unhide-resolution-scale-factor-on-linux.patch"
-  "patches/0011-edid-advertise-only-requested-resolution.patch"
-  "patches/0012-dxvk-hdr-off-when-client-sdr.patch"
-  "patches/0013-vaapi-vbr-default-on-amd.patch"
-  "patches/0014-vaapi-quality-and-forced-idr.patch"
-  "patches/0015-add-gamescope-steam-session-app.patch"
-  "patches/0016-host-side-default-scale-factor.patch"
-  "patches/0018-event-driven-evdi-capture.patch"
-  "patches/0019-vaapi-quality-configurable.patch"
-  "patches/0020-fps-instrumentation-and-tighter-evdi-pump.patch"
-  "patches/0021-monitor-recovery-safety-net.patch"
-  "patches/0022-evdi-search-range-to-64.patch"
   "apollo-monitor-recovery.sh"
   "apollo-gamescope-launch.sh"
   "evdi-perms.service"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 
+# Patches live in $startdir/patches/ (kept in a subdir to keep the repo root
+# tidy). makepkg's source[] resolution strips path components from local
+# entries, so we don't list them there — instead prepare() copies them into
+# $srcdir at build time. Patch order is the numeric sort of patches/*.patch.
 prepare() {
+  # Stage patches into $srcdir so the existing `patch -p1 -i "${srcdir}/..."`
+  # invocations below resolve. Touch each so the timestamp tracks this build.
+  cp -f "$startdir"/patches/*.patch "$srcdir"/
+
   cd "$_pkgsrc"
 
   local i _unwanted=(
@@ -291,6 +280,14 @@ prepare() {
   ## with high DRM minors are visible to apollo (otherwise we silently fall
   ## back to physical-display passthrough).
   patch -p1 -i "${srcdir}/0022-evdi-search-range-to-64.patch"
+
+  ## Throttle the EVDI pump's grab_pixels per handle to 60Hz so kwin paces its
+  ## commits to the EDID rate. Without this, kwin commits at ~90Hz on Plasma 6
+  ## / RDNA3 (verified by patch 0020's [FPS-EVDI] instrumentation), the encoder
+  ## drops the over-rate via video.cpp's variation-threshold path, and the
+  ## stream lands at ~53fps instead of 60. See the patch's commit message for
+  ## the full kernel/userspace chain.
+  patch -p1 -i "${srcdir}/0023-throttle-evdi-pump-grab-pixels-to-60hz.patch"
 
   ## Work around Apollo's phantom dependencies on `bootstrap` and `@fortawesome/fontawesome-free`.
   ## Their HTML/JS imports those packages but they're not in package.json — npm silently hoists

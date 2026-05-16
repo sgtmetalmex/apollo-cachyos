@@ -1,0 +1,96 @@
+Subject: throttle EVDI pump grab_pixels per handle to 60Hz
+
+The EVDI kernel has zero rate-limiting against the EDID refresh
+(verified by reading evdi_painter.c / evdi_modeset.c on v1.14.16 —
+pure event-driven, no period gate anywhere). Kwin's "vblank complete"
+signal on a virtual connector IS our pump's grab_pixels ioctl
+releasing painter->vblank via evdi_send_vblank() at
+evdi_painter.c:1185. So the rate at which we ACK pageflips IS the
+rate at which kwin schedules new commits.
+
+With patch 0020's 500us pump iteration we ACK up to 2000 flips/sec.
+Even with patch 0015's revised gamescope command line (no
+--immediate-flips, `-o $(APOLLO_CLIENT_FPS)` cap), kwin's own
+RenderLoop on Plasma 6 + RDNA3 can still commit faster than the
+60Hz EDID under load — measured at ~90 events/s during real streams
+([FPS-EVDI] events=90-95/s from patch 0020's instrumentation). The
+encoder then drops ~38/s of the over-rate via the
+`time_diff < -frame_variation_threshold` path in video.cpp, leaving
+~53/s encoded — exactly the 49-58fps the Steam Deck reports.
+
+This patch adds a per-handle "earliest next grab" timestamp tracked
+in a std::map<evdi_handle, steady_clock::time_point>. Before each
+poll on a handle's event fd we check the elapsed time; if it's
+less than 16667us (= 1/60s) we skip both the poll syscall and the
+grab_pixels ioctl for that iteration. Vblank stays queued in the
+kernel; kwin's commit_state thread blocks on the pending-pageflip
+check in drm_atomic_helper_setup_commit and won't schedule the
+next commit until we ACK.
+
+Net result: kwin paces itself to exactly 60Hz, the encoder's
+variation-threshold path never fires for "too early" frames, and
+the stream holds a clean 60fps end-to-end.
+
+The cap is currently a compile-time constant (60Hz) because all
+Apollo streaming targets in this project are 60fps. A future patch
+can plumb the configured client FPS through to here if needed.
+
+--- a/src/platform/linux/virtual_display.cpp
++++ b/src/platform/linux/virtual_display.cpp
+@@ -961,9 +961,30 @@ namespace VDISPLAY {
+     auto stats_window_start = std::chrono::steady_clock::now();
+     uint64_t fps_events_drained = 0;
+     uint64_t fps_grab_calls = 0;
+     uint64_t fps_poll_iters = 0;
+     uint64_t fps_grab_us_total = 0;
++
++    // Patch 0023: per-handle grab_pixels throttle.
++    //
++    // The EVDI kernel has zero rate-limiting against the EDID refresh
++    // (verified by reading evdi_painter.c / evdi_modeset.c — pure event-
++    // driven, no period gate). Kwin's "vblank complete" signal on a
++    // virtual connector IS our pump's grab_pixels ioctl releasing
++    // painter->vblank via evdi_send_vblank() at evdi_painter.c:1185.
++    // Without this throttle, our 500us pump iteration (patch 0020) ACKs
++    // flips faster than the EDID period, kwin commits at whatever rate
++    // its compositor scheduler runs (~90Hz on Plasma 6 / RDNA3 in our
++    // measurements), and the encoder drops the over-rate via the
++    // time_diff threshold path in video.cpp — stream lands at ~53 fps.
++    //
++    // Deferring grab_pixels here holds painter->vblank queued, back-
++    // pressuring kwin's commit_state thread until we ACK. Cap is 60Hz;
++    // if higher client rates are needed in the future, plumb the
++    // configured fps through to here.
++    constexpr int64_t MIN_GRAB_PERIOD_US = 16667;  // 1_000_000 / 60
++    std::map<evdi_handle, std::chrono::steady_clock::time_point> last_grab_at;
++
+ 
+     while (evdi_events_running) {
+       // Snapshot active EVDI handles + buf_ids + buffers under the lock,
+       // release before calling into libevdi.
+@@ -996,7 +1018,16 @@ namespace VDISPLAY {
+         pfd.fd = fd;
+         pfd.events = POLLIN;
+         ++fps_poll_iters;
+-        if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
++        // Patch 0023: throttle gate. If grab_pixels for this handle ran
++        // within the last MIN_GRAB_PERIOD_US, skip drain+grab this
++        // iteration. Vblank stays queued in the kernel; kwin's commit
++        // thread blocks until next ACK.
++        auto now_grab = std::chrono::steady_clock::now();
++        auto last_it = last_grab_at.find(e.handle);
++        bool grab_throttled = (last_it != last_grab_at.end()) &&
++                              std::chrono::duration_cast<std::chrono::microseconds>(
++                                  now_grab - last_it->second).count() < MIN_GRAB_PERIOD_US;
++        if (!grab_throttled && ::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+           // We have an event. Dispatch (no-op callback), then drain the
+           // dirty rectangles — that ioctl is what releases the kernel's
+           // queued vblank back to kwin and copies the framebuffer into
+@@ -1011,6 +1041,7 @@ namespace VDISPLAY {
+           fps_grab_us_total += std::chrono::duration_cast<std::chrono::microseconds>(grab_t1 - grab_t0).count();
+           ++fps_grab_calls;
+           ++fps_events_drained;
++          last_grab_at[e.handle] = now_grab;  // Patch 0023: record grab time for throttle
+ 
+           // The kernel just copied a fresh frame into our registered buffer.
+           // Bump the frame counter so the capture side knows there's new data.

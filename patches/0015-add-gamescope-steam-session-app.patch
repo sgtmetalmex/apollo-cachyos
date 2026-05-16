@@ -2,7 +2,19 @@ Subject: apps.json: add "Gamescope Steam Session" default entry
 
 User request: a Steam streaming target that runs through Gamescope so the
 session behaves like SteamOS Gaming Mode — forced fullscreen, FSR
-upscaling, tight refresh-rate handling, immediate-flips presentation.
+upscaling, tight refresh-rate handling, FIFO-paced presentation.
+
+NOTE: an earlier revision passed `--immediate-flips`. Diagnosis traced
+the 49-58fps "stream cap" symptom to that flag: in nested-wayland mode
+`--immediate-flips` bypasses kwin's frame-callback throttling, so
+gamescope committed buffers to its kwin parent faster than the EDID's
+60Hz, kwin propagated each commit as fresh damage on the EVDI surface
+(~90 events/s), and Apollo's encoder dropped the over-rate via the
+`time_diff < -frame_variation_threshold` path (-> popped 90/s, encoded
+53/s, skipped 38/s on real streams). Replacing `--immediate-flips` with
+`-o $(APOLLO_CLIENT_FPS)` caps gamescope's render-loop FPS to the
+client's negotiated rate, lets it FIFO-pace presentation, and matches
+kwin's 60Hz pageflip cadence end-to-end.
 
 Gamescope (gamescope 3.16+, already a CachyOS package) is a micro-
 compositor designed for game presentation. Nesting it inside kwin on
@@ -13,7 +25,9 @@ the EVDI virtual display gives us:
   - `--upscale-filter fsr --upscale-sharpness 4` FSR 1.0 upscaling
     (games can render at lower internal res for perf; gamescope
     upscales to the EVDI buffer's resolution)
-  - `--immediate-flips` lowest-latency present path
+  - `-o $(APOLLO_CLIENT_FPS)` cap nested compositor output rate to
+    the client's negotiated FPS (paired with `-r` advertising the
+    same value — `-r` is advisory, `-o` enforces)
   - `-e` Steam integration (gamepad input routing, app lifecycle)
   - When gamescope exits, the wrapping `steam -bigpicture` exits too,
     cleanly ending the Apollo session
@@ -48,7 +62,7 @@ use cases work without it).
 +      "wait-all": true,
 +      "exit-timeout": 5,
 +      "scale-factor": 100,
-+      "cmd": "gamescope --backend=wayland -W $(APOLLO_CLIENT_WIDTH) -H $(APOLLO_CLIENT_HEIGHT) -r $(APOLLO_CLIENT_FPS) -f -e --upscale-filter fsr --upscale-sharpness 4 --immediate-flips -- steam -bigpicture"
++      "cmd": "gamescope --backend=wayland -W $(APOLLO_CLIENT_WIDTH) -H $(APOLLO_CLIENT_HEIGHT) -r $(APOLLO_CLIENT_FPS) -o $(APOLLO_CLIENT_FPS) -f -e --upscale-filter fsr --upscale-sharpness 4 -- steam -bigpicture"
      }
    ]
  }
